@@ -107,6 +107,12 @@ function parse_epanet(filename::String)
     # Set up a dictionary containing short pipe objects.
     epanet_data["short_pipe"] = Dict{String,Any}()
 
+    # Set up a dictionary containing expansion short pipe objects.
+    epanet_data["ne_short_pipe"] = Dict{String,Any}()
+
+    # Set up a dictionary containing expansion pump objects.
+    epanet_data["ne_pump"] = Dict{String,Any}()
+
     # Set up a dictionary containing design pipe objects.
     epanet_data["des_pipe"] = Dict{String,Any}()
 
@@ -776,7 +782,7 @@ function _read_pattern!(data::Dict{String,<:Any})
         name = current[1]
 
         if !(name in keys(data["pattern"]))
-            data["pattern"][name] = Array{Float64,1}()
+            data["pattern"][name] = Vector{Float64}()
         end
 
         values = [parse(Float64, s) for s in current[2:end]]
@@ -918,33 +924,45 @@ function _read_pump!(data::Dict{String,<:Any})
         # Loop over remaining entries and store remaining properties.
         for i in range(4; stop = length(current), step = 2)
             if uppercase(current[i]) == "POWER"
-                Memento.error(_LOGGER, "Constant power pumps are not supported.")
+                # Memento.error(_LOGGER, "Constant power pumps are not supported.")
+                pump["pump_type"] = PUMP_CONSTANT_POWER
+
+                # Parse the head of the reservoir (in meters).
+                if data["flow_units"] == "LPS" || data["flow_units"] == "CMH"
+                    # Conver power from kilowatts to watts.
+                    pump["power"] = 1.0e3 * parse(Float64, current[i+1])
+                elseif data["flow_units"] == "GPM" # If gallons per minute...
+                    # Convert power from horsepower to watts.
+                    pump["power"] = 745.7 * parse(Float64, current[i+1])
+                else
+                    Memento.error(_LOGGER, "Could not find a valid \"units\" option type.")
+                end
+            elseif uppercase(current[i]) == "HEAD"
+                # Obtain and scale head-versus-flow pump curve.
+                flow = first.(data["curve"][current[i+1]]) # Flow.
+                head = last.(data["curve"][current[i+1]]) # Head.
+
+                if data["flow_units"] == "LPS" # If liters per second...
+                    # Convert from liters per second to cubic meters per second.
+                    flow *= 1.0e-3
+                elseif data["flow_units"] == "CMH" # If cubic meters per hour...
+                    # Convert from cubic meters per hour to cubic meters per second.
+                    flow *= inv(3600.0)
+                elseif data["flow_units"] == "GPM" # If gallons per minute...
+                    # Convert from gallons per minute to cubic meters per second.
+                    flow *= 6.30902e-5
+
+                    # Convert head from feet to meters.
+                    head *= 0.3048
+                else
+                    Memento.error(_LOGGER, "Could not find a valid \"units\" option type.")
+                end
+
+                # Curve of head (meters) versus flow (cubic meters per second).
+                pump["head_curve"] = Array([(flow[j], head[j]) for j = 1:length(flow)])     
             elseif uppercase(current[i]) != "HEAD"
                 Memento.error(_LOGGER, "Pump keyword in INP file not recognized.")
             end
-
-            # Obtain and scale head-versus-flow pump curve.
-            flow = first.(data["curve"][current[i+1]]) # Flow.
-            head = last.(data["curve"][current[i+1]]) # Head.
-
-            if data["flow_units"] == "LPS" # If liters per second...
-                # Convert from liters per second to cubic meters per second.
-                flow *= 1.0e-3
-            elseif data["flow_units"] == "CMH" # If cubic meters per hour...
-                # Convert from cubic meters per hour to cubic meters per second.
-                flow *= inv(3600.0)
-            elseif data["flow_units"] == "GPM" # If gallons per minute...
-                # Convert from gallons per minute to cubic meters per second.
-                flow *= 6.30902e-5
-
-                # Convert head from feet to meters.
-                head *= 0.3048
-            else
-                Memento.error(_LOGGER, "Could not find a valid \"units\" option type.")
-            end
-
-            # Curve of head (meters) versus flow (cubic meters per second).
-            pump["head_curve"] = Array([(flow[j], head[j]) for j = 1:length(flow)])
         end
 
         # Flow is always in the positive direction for pumps.
@@ -1016,6 +1034,8 @@ function _read_reservoir!(data::Dict{String,<:Any})
             reservoir["elevation"] = reservoir["head_nominal"]
         else
             reservoir["elevation"] = reservoir["head_nominal"]
+            reservoir["head_min"] = reservoir["head_nominal"]
+            reservoir["head_max"] = reservoir["head_nominal"]
         end
 
         # Add a temporary index to be used in the data dictionary.
@@ -1204,8 +1224,7 @@ end
 
 
 function _get_max_link_id(data::Dict{String,<:Any})
-    arc_types = ["pipe", "pump", "regulator", "short_pipe", "valve"]
-    return maximum(maximum([x["index"] for (i, x) in data[t]]) for t in arc_types)
+    return maximum(maximum([x["index"] for (i, x) in data[t]]) for t in _LINK_COMPONENTS)
 end
 
 
@@ -1224,7 +1243,7 @@ end
 
 function _convert_short_pipes!(data::Dict{String,<:Any}, head_loss::String, viscosity::Float64)
     exponent = _get_exponent_from_head_loss_form(head_loss)
-    max_flow_exp = abs(_calc_capacity_max(data))^exponent
+    max_flow_exp = abs(calc_capacity_max(data))^exponent
 
     wm_data = get_wm_data(data)
     head_transform = _calc_head_per_unit_transform(wm_data)

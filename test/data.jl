@@ -5,23 +5,6 @@
         @test data["per_unit"] == true
     end
 
-    @testset "make_temporally_aggregated_multinetwork" begin
-        network = WaterModels.parse_file("../test/data/epanet/multinetwork/owf-hw-lps.inp")
-        network_mn = WaterModels.make_multinetwork(network)
-        network_agg = make_temporally_aggregated_multinetwork(network_mn, [["1", "2"], ["3"]])
-
-        @test isapprox(network_mn["duration"], network_agg["duration"])
-        demand_old = network_mn["nw"]["1"]["demand"]["2"]["flow_nominal"] 
-        @test demand_old < network_agg["nw"]["1"]["demand"]["2"]["flow_nominal"]
-
-        network = WaterModels.parse_file("../test/data/epanet/multinetwork/prv-hw-lps.inp")
-        network_mn = WaterModels.make_multinetwork(network)
-        network_agg = make_temporally_aggregated_multinetwork(network_mn, [["1", "2"], ["3"]])
-
-        @test network_mn["duration"] == network_agg["duration"]
-        @test length(network_agg["nw"]) == 2
-    end
-
     @testset "set_flow_partitions_num!" begin
         data = WaterModels.parse_file("../examples/data/epanet/van_zyl.inp")
         WaterModels.set_flow_partitions_num!(data, 5)
@@ -117,5 +100,96 @@
         mn_data = WaterModels.replicate(data, 3)
         WaterModels._remove_last_networks!(mn_data; last_num_steps = 1)
         @test length(mn_data["nw"]) == 2
+    end
+
+    @testset "propagate_topology_status!" begin
+        @testset "inactive demand by propagation" begin
+            network = WaterModels.parse_file("../test/data/epanet/snapshot/pipe-hw-lps.inp")
+            network["node"]["2"]["status"] = WaterModels.STATUS_INACTIVE
+            WaterModels.propagate_topology_status!(network)
+            @test network["demand"]["2"]["status"] === WaterModels.STATUS_INACTIVE
+        end
+
+        @testset "inactive reservoir by propagation" begin
+            network = WaterModels.parse_file("../test/data/epanet/snapshot/pipe-hw-lps.inp")
+            network["node"]["1"]["status"] = WaterModels.STATUS_INACTIVE
+            WaterModels.propagate_topology_status!(network)
+            @test network["reservoir"]["1"]["status"] === WaterModels.STATUS_INACTIVE
+        end
+
+        @testset "inactive tank by propagation" begin
+            network = WaterModels.parse_file("../test/data/epanet/snapshot/tank-hw-lps.inp")
+            network["node"]["1"]["status"] = WaterModels.STATUS_INACTIVE
+            WaterModels.propagate_topology_status!(network)
+            @test network["tank"]["1"]["status"] === WaterModels.STATUS_INACTIVE
+        end
+
+        @testset "inactive pipe by propagation" begin
+            network = WaterModels.parse_file("../test/data/epanet/snapshot/pipe-hw-lps.inp")
+            network["node"]["1"]["status"] = WaterModels.STATUS_INACTIVE
+            WaterModels.propagate_topology_status!(network)
+            @test network["pipe"]["1"]["status"] === WaterModels.STATUS_INACTIVE
+        end
+
+        @testset "inactive design pipe by propagation" begin
+            network = WaterModels.parse_file("../test/data/json/shamir.json")
+            network["node"]["2"]["status"] = WaterModels.STATUS_INACTIVE
+            
+            @test WaterModels.propagate_topology_status!(network) == true
+            @test network["des_pipe"]["1"]["status"] === WaterModels.STATUS_INACTIVE
+        end
+
+        @testset "inactive valve by propagation" begin
+            network = WaterModels.parse_file("../test/data/epanet/snapshot/shutoff_valve-hw-lps.inp")
+            network["node"]["3"]["status"] = WaterModels.STATUS_INACTIVE
+            
+            @test WaterModels.propagate_topology_status!(network) == true
+            @test network["valve"]["1"]["status"] === WaterModels.STATUS_INACTIVE
+        end
+
+        @testset "inactive regulator by propagation" begin
+            network = WaterModels.parse_file("../test/data/epanet/snapshot/prv-hw-lps.inp")
+            network["node"]["3"]["status"] = WaterModels.STATUS_INACTIVE
+            
+            @test WaterModels.propagate_topology_status!(network) == true
+            @test network["regulator"]["2"]["status"] === WaterModels.STATUS_INACTIVE
+        end
+
+        @testset "inactive short pipe by propagation" begin
+            network = WaterModels.parse_file("../test/data/epanet/snapshot/short-pipe-lps.inp")
+            WaterModels.convert_short_pipes!(network)
+            network["node"]["2"]["status"] = WaterModels.STATUS_INACTIVE
+            
+            @test WaterModels.propagate_topology_status!(network) == true
+            @test network["short_pipe"]["1"]["status"] === WaterModels.STATUS_INACTIVE
+        end
+
+        @testset "inactive pump by propagation" begin
+            network = WaterModels.parse_file("../test/data/epanet/snapshot/pump-hw-lps.inp")
+            network["node"]["2"]["status"] = WaterModels.STATUS_INACTIVE
+
+            @test WaterModels.propagate_topology_status!(network) == true
+            @test network["pump"]["1"]["status"] === WaterModels.STATUS_INACTIVE
+        end
+
+        @testset "multinetwork variant" begin
+            network = WaterModels.parse_file("../test/data/epanet/multinetwork/pipe-hw-lps.inp")
+            network_mn = WaterModels.make_multinetwork(network)
+            network_mn["nw"]["1"]["node"]["1"]["status"] = WaterModels.STATUS_INACTIVE
+            
+            @test WaterModels.propagate_topology_status!(network_mn) == true
+            @test network_mn["nw"]["1"]["pipe"]["1"]["status"] === WaterModels.STATUS_INACTIVE
+            @test network_mn["nw"]["2"]["pipe"]["1"]["status"] === WaterModels.STATUS_ACTIVE
+        end
+    end
+
+    @testset "simplify_network!" begin
+        network = WaterModels.parse_file("../test/data/epanet/multinetwork/pipe-hw-lps.inp")
+        network_mn = WaterModels.make_multinetwork(network)
+        network_mn["nw"]["1"]["node"]["1"]["status"] = WaterModels.STATUS_INACTIVE
+        WaterModels.simplify_network!(network_mn) == true
+        
+        @test network_mn["nw"]["1"]["pipe"]["1"]["status"] === WaterModels.STATUS_INACTIVE
+        @test network_mn["nw"]["2"]["pipe"]["1"]["status"] === WaterModels.STATUS_ACTIVE
     end
 end

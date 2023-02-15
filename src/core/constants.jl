@@ -14,6 +14,7 @@ JSON.lower(x::FLOW_DIRECTION) = Int(x)
     PUMP_BEST_EFFICIENCY_POINT = 1 # Head gain takes a quadratic best efficiency form.
     PUMP_EPANET = 2 # Head gain takes the form used by EPANET.
     PUMP_LINEAR_POWER = 3 # Power is modeled linearly and head gain quadratic.
+    PUMP_CONSTANT_POWER = 4 # Power is constant when the pump is active.
 end
 
 "Ensures that JSON serialization of `PUMP` returns an integer."
@@ -37,3 +38,9 @@ const _GRAVITY = 9.80665 # In meters per second squared.
 
 "Defines the constant for the density of water."
 const _DENSITY = 1000.0 # In kilograms per cubic meter.
+
+"Defines a convenient vector for node-connected component types."
+const _NODE_CONNECTED_COMPONENTS = ["demand", "reservoir", "tank"]
+
+"Defines a convenient vector for node-connecting component types."
+const _LINK_COMPONENTS = ["pipe", "pump", "ne_pump", "regulator", "short_pipe", "valve", "des_pipe", "ne_short_pipe"]

@@ -2,36 +2,6 @@
 ### This is built upon https://github.com/lanl-ansi/PowerModels.jl/blob/master/src/util/obbt.jl
 
 
-"""
-Iteratively tighten bounds on water model variables.
-By default, the function uses the PWLRD relaxation for performing bound tightening.
-
-# Example
-
-The function can be invoked as follows:
-
-```
-gurobi = JuMP.optimizer_with_attributes(Gurobi.Optimizer)
-solve_obbt_owf!("examples/data/epanet/van_zyl.inp", gurobi)
-```
-
-# Keyword Arguments
-* `model_type`: relaxation to use for performing bound tightening.
-* `max_iter`: maximum number of bound tightening iterations to perform.
-* `time_limit`: maximum amount of time (seconds) for the bound tightening algorithm.
-* `upper_bound`: can be used to specify a local feasible solution objective for the problem.
-* `upper_bound_constraint`: boolean option that can be used to add an additional
-   constraint to reduce the search space of each of the bound tightening
-   solves. This cannot be set to `true` without specifying an upper bound.
-* `use_relaxed_network`: boolean option that specifies whether or not to use a relaxed,
-   snapshot, dispatchable version of the origin multinetwork problem for bound tightening.
-"""
-function solve_obbt_owf!(file::String, optimizer; kwargs...)
-    data = WaterModels.parse_file(file)
-    return solve_obbt_owf!(data, optimizer; kwargs...)
-end
-
-
 function _fix_indicator(v::JuMP.VariableRef, value::Float64)
     if JuMP.is_binary(v)
         JuMP.fix(v, value)
@@ -57,8 +27,16 @@ function _solve_bound_problem!(wm::AbstractWaterModel, bound_problem::BoundProbl
     v_one = _get_variable_from_index.(Ref(wm), bound_problem.variables_fix_one)
     v_zero = _get_variable_from_index.(Ref(wm), bound_problem.variables_fix_zero)
 
+    # Determine if the variable being tightened is discrete.
+    if isa(v, JuMP.VariableRef)
+        var_is_discrete = any(occursin(x, JuMP.name(v)) for x in ["_x", "_y", "_z"])
+    else
+        var_is_discrete = false
+    end
+
     # Fix binary variables to desired values.
-    _fix_indicator.(v_one, 1.0), _fix_indicator.(v_zero, 0.0)
+    _fix_indicator.(v_one, 1.0)
+    _fix_indicator.(v_zero, 0.0)
     vars_relaxed = Vector{JuMP.VariableRef}([])
 
     if ismultinetwork(wm)
@@ -71,39 +49,50 @@ function _solve_bound_problem!(wm::AbstractWaterModel, bound_problem::BoundProbl
     # Optimize the variable (or affine expression) being tightened.
     JuMP.@objective(wm.model, bound_problem.sense, v)
     JuMP.optimize!(wm.model)
-    termination_status = JuMP.termination_status(wm.model) 
+    termination_status = JuMP.termination_status(wm.model)
+
+    if !(termination_status in [JuMP.INFEASIBLE, JuMP.INFEASIBLE_OR_UNBOUNDED])
+        try
+            # Store the candidate bound calculated from the optimization.
+            candidate = JuMP.objective_bound(wm.model)
+        catch
+            # Otherwise, store the original bound.
+            candidate = bound_problem.bound
+        end
+    else
+        bound_problem.infeasible = true
+        candidate = bound_problem.bound
+    end
 
     if ismultinetwork(wm)
         JuMP.set_binary.(vars_relaxed)
     end
 
-    # Store the candidate bound calculated from the optimization.
-    if termination_status in [JuMP.LOCALLY_SOLVED, JuMP.OPTIMAL]
-        candidate = JuMP.objective_value(wm.model)
+    # Update the candidate if it's for a discrete variable.
+    if var_is_discrete && bound_problem.sense === JuMP.MIN_SENSE
+        candidate = candidate > 0.01 ? 1.0 : candidate
+    elseif var_is_discrete && bound_problem.sense === JuMP.MAX_SENSE
+        candidate = candidate < 0.99 ? 0.0 : candidate
     end
 
     # Unfix binary variables that were fixed above.
     _unfix_indicator.(v_one), _unfix_indicator.(v_zero)
 
-    # Return an optimized bound or the initial bound that was started with.
-    if termination_status in [JuMP.LOCALLY_SOLVED, JuMP.OPTIMAL]
-        # Get the objective value and return the better of the old and new bounds.
-        if bound_problem.sense === JuMP.MIN_SENSE
-            return max(bound_problem.bound, candidate)
-        elseif bound_problem.sense === JuMP.MAX_SENSE
-            return min(bound_problem.bound, candidate)
-        end
-    else
-        return bound_problem.bound # Optimization was not successful. Return the starting bound.
+    # Return the better of the old and new bounds.
+    if bound_problem.sense === JuMP.MIN_SENSE
+        return max(bound_problem.bound, candidate)
+    elseif bound_problem.sense === JuMP.MAX_SENSE
+        return min(bound_problem.bound, candidate)
     end
 end
 
 
 function _set_new_bound!(bound_problem::BoundProblem, candidate::Float64)
     prec = bound_problem.precision
-
+    num_digits = Int(ceil(-log10(prec)))
+ 
     if bound_problem.sense === JuMP.MIN_SENSE
-        scaled_candidate = floor(inv(prec) * candidate) * prec
+        scaled_candidate = floor(candidate; digits = num_digits)
 
         if scaled_candidate > bound_problem.bound
             setfield!(bound_problem, :bound, scaled_candidate)
@@ -112,7 +101,7 @@ function _set_new_bound!(bound_problem::BoundProblem, candidate::Float64)
             setfield!(bound_problem, :changed, false)
         end
     else
-        scaled_candidate = ceil(inv(prec) * candidate) * prec
+        scaled_candidate = ceil(candidate; digits = num_digits)
 
         if scaled_candidate < bound_problem.bound
             setfield!(bound_problem, :bound, scaled_candidate)
@@ -134,6 +123,16 @@ function _update_data_bounds!(data::Dict{String,<:Any}, bound_problems::Array{Bo
         comp = data_nw[string(vid.component_type)][string(vid.component_index)]
         comp[bound_problem.bound_name] = bound_problem.bound
     end
+
+    # Perform data correction routines.
+    correct_pipes!(data_wm)
+    correct_des_pipes!(data_wm)
+    correct_pumps!(data_wm)
+    correct_regulators!(data_wm)
+    correct_short_pipes!(data_wm)
+    correct_ne_short_pipes!(data_wm)
+    correct_valves!(data_wm)
+    correct_nodes!(data_wm)
 end
 
 
@@ -231,7 +230,9 @@ function _log_bound_widths(data::Dict{String,<:Any})
     message = ""
     message *= _log_node_bound_width(wm_data, "node")    
     message *= _log_flow_bound_width(wm_data, "pipe")
+    message *= _log_flow_bound_width(wm_data, "des_pipe")
     message *= _log_flow_bound_width(wm_data, "short_pipe")
+    message *= _log_flow_bound_width(wm_data, "ne_short_pipe")
     message *= _log_flow_bound_width(wm_data, "valve")
     message *= _log_forward_flow_bound_width(wm_data, "pump")
     message *= _log_forward_flow_bound_width(wm_data, "regulator")
@@ -241,7 +242,7 @@ end
 
 
 "Remove bound problems where a discrete variable has been successfully fixed."
-function _clean_bound_problems!(problems::Vector{BoundProblem}, vals::Vector{Float64})
+function _clean_bound_problems(problems::Vector{BoundProblem}, vals::Vector{Float64})
     # Initialize vectors for storing fixed binary variables.
     fixed_one_vars = Vector{_VariableIndex}([])
     fixed_zero_vars = Vector{_VariableIndex}([])
@@ -268,123 +269,182 @@ function _clean_bound_problems!(problems::Vector{BoundProblem}, vals::Vector{Flo
         end
     end
 
+    # Initialize the new vector of problems, which may be reduced.
+    problems_new = Vector{BoundProblem}([])
+    
     for problem in problems
         # Check if the problem fixes one of the variables that has now been fixed.
         contains_fixed_one = any([x in problem.variables_fix_one for x in fixed_zero_vars])
         contains_fixed_zero = any([x in problem.variables_fix_zero for x in fixed_one_vars])
 
         # If the problem fixes variables that we already proved can be fixed, remove it.
-        if contains_fixed_one || contains_fixed_zero
-            problems = Vector{BoundProblem}(setdiff!(problems, [problem]))
+        if !(contains_fixed_one || contains_fixed_zero) && !problem.infeasible
+            push!(problems_new, problem)
         end
     end
+
+    # Return the new vector of bound problems.
+    return problems_new
 end
 
 
-function solve_obbt_owf!(
-    data::Dict{String,<:Any}, optimizer; use_relaxed_network::Bool = true,
-    model_type::Type = PWLRDWaterModel, time_limit::Float64 = 3600.0,
-    upper_bound::Float64 = Inf, upper_bound_constraint::Bool = false,
-    max_iter::Int = 100, solve_relaxed::Bool = true,
-    flow_partition_func::Function = x -> set_flow_partitions_si!(x, 1.0, 1.0e-4),
-    limit_problems::Bool = false, kwargs...)
-    # Print a message with relevant algorithm limit information.
-    message = "[OBBT] Maximum time limit set to default value of $(time_limit) seconds."
-    Memento.info(_LOGGER, message)
+"Solve a sequence of OBBT problems based on multinetwork data."
+function solve_obbt_seq(data::Dict{String,<:Any}, build_method::Function, optimizer; kwargs...)
+    num_time_steps = data["time_series"]["num_steps"]
+    network_mn = make_multinetwork(data)
 
-    # Relax the network (e.g., make nodal components dispatchable) if requested.
-    use_relaxed_network && relax_network!(data)
+    Memento.info(_LOGGER, "[OBBT] Beginning multistep OBBT routine.")
+    time_elapsed = 0.0
 
-    # Set the problem specification that will be used for bound tightening.
-    build_type = _IM.ismultinetwork(get_wm_data(data)) ? build_mn_wf : build_wf
-
-    # Check for keyword argument inconsistencies.
-    _check_obbt_options(upper_bound, upper_bound_constraint)
-
-    # Instantiate the bound tightening model and relax integrality, if requested.
-    wms = [instantiate_model(data, model_type, build_type) for i in 1:Threads.nthreads()]
-
-    if upper_bound_constraint
-        map(x -> _constraint_obj_bound(x, upper_bound), wms)
-    end
-
-    if solve_relaxed
-        # Relax the binary variables if requested.
-        map(x -> relax_all_binary_variables!(x), wms)
-    end
-
-    # Set the optimizer for the bound tightening model.
-    map(x -> JuMP.set_optimizer(x.model, optimizer), wms)
-
-    # Collect all problems.
-    bound_problems = _get_bound_problems(wms[1]; limit = limit_problems)
-    _update_data_bounds!(data, bound_problems) # Populate data with bounds.
-
-    # Log widths.
-    bound_width_msg = _log_bound_widths(data)
-    Memento.info(_LOGGER, "[OBBT] Initial bound widths: $(bound_width_msg).")
-    terminate, time_elapsed = false, 0.0
-
-    # Set up algorithm metadata.
-    current_iteration = 1
-    terminate = current_iteration >= max_iter
-
-    while any([x.changed for x in bound_problems]) && !terminate
-        # Obtain new candidate bounds, update bounds, and update the data.
-        vals = zeros(length(bound_problems))
-
-        time_elapsed += @elapsed Threads.@threads for i in 1:length(bound_problems)
-            vals[i] = _solve_bound_problem!(wms[Threads.threadid()], bound_problems[i])
-            _set_new_bound!(bound_problems[i], vals[i])
-        end
-
-        time_elapsed > time_limit && ((terminate = true) && break)
-        _update_data_bounds!(data, bound_problems)
-        flow_partition_func(data)
-        !terminate && _clean_bound_problems!(bound_problems, vals)
-
-        # Log widths.
-        bound_width_msg = _log_bound_widths(data)
-        message = "[OBBT] Iteration $(current_iteration) bound widths: $(bound_width_msg)."
+    for nw in 1:num_time_steps-1
+        message = "[OBBT] Starting OBBT for network with multinetwork index $(nw)."
         Memento.info(_LOGGER, message)
 
-        # Update algorithm metadata.
-        current_iteration += 1
+        data_nw = deepcopy(data)
+        _IM.load_timepoint!(data_nw, nw)
 
-        # Set up the next optimization problem using the new bounds.
-        wms = [instantiate_model(data, model_type, build_type) for i in 1:Threads.nthreads()]
-
-        if upper_bound_constraint
-            map(x -> _constraint_obj_bound(x, upper_bound), wms)
+        if nw != 1
+            map(x -> x["dispatchable"] = true, values(data_nw["tank"]))
+            time_elapsed += @elapsed solve_obbt!(data_nw, build_method, optimizer; kwargs...)
+            map(x -> x["dispatchable"] = false, values(data_nw["tank"]))
+        else
+            time_elapsed += @elapsed solve_obbt!(data_nw, build_method, optimizer; kwargs...)
         end
 
-        if solve_relaxed
-            # Relax the binary variables if requested.
-            map(x -> relax_all_binary_variables!(x), wms)
+        network_mn["nw"][string(nw)] = data_nw
+
+        for key in _wm_global_keys
+            delete!(network_mn["nw"][string(nw)], key)
         end
-
-        # Set the optimizer for the bound tightening model.
-        map(x -> JuMP.set_optimizer(x.model, optimizer), wms)
-
-        # Set the termination variable if max iterations is exceeded.
-        current_iteration >= max_iter && (terminate = true)
-    end
-
-    if use_relaxed_network
-        _fix_demands!(data)
-        _fix_tanks!(data)
-        _fix_reservoirs!(data)
     end
 
     time_elapsed_rounded = round(time_elapsed; digits = 2)
-    Memento.info(_LOGGER, "[OBBT] Completed in $(time_elapsed_rounded) seconds.")
+    Memento.info(_LOGGER, "Multistep OBBT routine completed in $(time_elapsed_rounded) seconds.")
+
+    return network_mn
 end
 
 
-function _check_obbt_options(ub::Float64, ub_constraint::Bool)
-    if ub_constraint && isinf(ub)
-        message = "[OBBT] The option \"upper_bound_constraint\" cannot " *
-            "be set to true without specifying an upper bound."
-        Memento.error(_LOGGER, message)
+function solve_obbt!(
+    data::Dict{String,<:Any}, build_method::Function, optimizer;
+    model_type::Type = PWLRDWaterModel, time_limit::Float64 = 3600.0,
+    upper_bound::Float64 = Inf, max_iter::Int = 100, relax_integrality::Bool = false,
+    flow_partition_func::Function = x -> set_flow_partitions_si!(x, 1.0, 1.0e-4),
+    limit_problems::Bool = false, kwargs...)
+    # Print a message with relevant algorithm limit information.
+    message = "[OBBT] Time limit set to $(time_limit) seconds."
+    Memento.info(_LOGGER, message)
+
+    # Execute the flow partitioning function.
+    flow_partition_func(data)
+
+    # Instantiate the bound tightening model and relax integrality, if requested.
+    wms = Vector{AbstractWaterModel}(undef, Threads.nthreads())
+
+    # Update WaterModels objects in parallel.
+    Threads.@threads for i in 1:Threads.nthreads()
+        wms[i] = instantiate_model(deepcopy(data), model_type, build_method)
+
+        if upper_bound < Inf
+            # Add a constraint on the objective upper bound.
+            objective_expr = JuMP.objective_function(wms[i].model)
+            JuMP.@constraint(wms[i].model, objective_expr <= upper_bound)
+        end
+
+        if relax_integrality
+            # Relax the binary variables if requested.
+            relax_all_binary_variables!(wms[i])
+        end
+
+        # Set the optimizer for the bound tightening model.
+        JuMP.set_optimizer(wms[i].model, optimizer)
     end
+
+    # Collect all bound tightening problems and update bounds in `data`.
+    bound_problems = _get_bound_problems(wms[1]; limit = limit_problems)
+    _update_data_bounds!(data, bound_problems) # Populate data with bounds.
+
+    # Log mean ranges between important lower and upper bounds.
+    bound_width_msg = _log_bound_widths(data)
+    Memento.info(_LOGGER, "[OBBT] Initial bound widths: $(bound_width_msg).")
+    Memento.info(_LOGGER, "[OBBT] Solving $(length(bound_problems)) subproblems.")
+
+    # Instantiate termination and time logging variables.
+    current_iteration = 1 # Tracks the iteration counter of the algorithm.
+    time_elapsed = 0.0 # Tracks the amount of algorithm time elapsed.
+    parallel_time_elapsed = 0.0 # Tracks the ideal parallel time elapsed.
+    
+    # Instantiate the variable that determines when OBBT is terminated.
+    terminate = current_iteration >= max_iter
+
+    while any([x.changed for x in bound_problems]) && !terminate
+        # Initialize vector of bound candidates.
+        vals = zeros(length(bound_problems))
+
+        # Initialize vector of time elapsed per problem.
+        parallel_times_elapsed = zeros(length(bound_problems))
+
+        # Parallelize all bound tightening problems over available threads.
+        time_elapsed += @elapsed Threads.@threads for i in 1:length(bound_problems)
+            # Solve the bound tightening problem and store the candidate.
+            parallel_times_elapsed = @elapsed vals[i] = _solve_bound_problem!(
+                wms[Threads.threadid()], bound_problems[i])
+
+            # Update the bound stored in the bound problem definition.
+            _set_new_bound!(bound_problems[i], vals[i])
+        end
+
+        # Update the ideal parallel time elapsed from the current iteration.
+        parallel_time_elapsed += maximum(parallel_times_elapsed)
+
+        # Update all bounds within `data` using the new bounds in `bound_problems`.
+        _update_data_bounds!(data, bound_problems)
+
+        # Re-execute the flow partitioning function.
+        flow_partition_func(data)
+
+        if !terminate
+            # Remove bound problems where discrete variables were fixed.
+            bound_problems = _clean_bound_problems(bound_problems, vals)
+        end
+
+        # Log mean ranges between important lower and upper bounds.
+        bound_width_msg = _log_bound_widths(data)
+        message = "[OBBT] Iteration $(current_iteration): bound widths: $(bound_width_msg)."
+        Memento.info(_LOGGER, message)
+        Memento.info(_LOGGER, "[OBBT] Next iteration, Solving $(length(bound_problems)) subproblems.")
+
+        # Check if the time limit has been exceeded and terminate, if necessary.
+        time_elapsed > time_limit && ((terminate = true) && break)
+
+        # Update the current iteration of the algorithm.
+        current_iteration += 1
+
+        # Set the termination variable if max iterations is exceeded.
+        current_iteration > max_iter && (terminate = true)
+
+        # Update WaterModels objects in parallel.
+        Threads.@threads for i in 1:Threads.nthreads()
+            wms[i] = instantiate_model(deepcopy(data), model_type, build_method)
+
+            if upper_bound < Inf
+                # Add a constraint on the objective upper bound.
+                objective_expr = JuMP.objective_function(wms[i].model)
+                JuMP.@constraint(wms[i].model, objective_expr <= upper_bound)
+            end
+
+            if relax_integrality
+                # Relax the binary variables if requested.
+                relax_all_binary_variables!(wms[i])
+            end
+
+            # Set the optimizer for the bound tightening model.
+            JuMP.set_optimizer(wms[i].model, optimizer)
+        end
+    end
+
+    time_elapsed_rounded = round(time_elapsed; digits = 2)
+    parallel_time_elapsed_rounded = round(parallel_time_elapsed; digits = 2)
+    Memento.info(_LOGGER, "[OBBT] Completed in $(time_elapsed_rounded) " *
+        "seconds (ideal parallel time: $(parallel_time_elapsed_rounded) seconds).")
 end

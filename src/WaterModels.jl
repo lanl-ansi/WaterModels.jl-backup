@@ -7,6 +7,7 @@ const _IM = InfrastructureModels
 import Interpolations
 import JSON
 import JuMP
+import LsqFit
 import Memento
 import PolyhedralRelaxations
 import Statistics
@@ -63,11 +64,15 @@ include("core/demand.jl")
 include("core/reservoir.jl")
 include("core/tank.jl")
 
+include("core/link.jl")
 include("core/pipe.jl")
+include("core/des_pipe.jl")
 include("core/pump.jl")
 include("core/regulator.jl")
 include("core/short_pipe.jl")
 include("core/valve.jl")
+
+println("This is the developing version")
 
 include("core/data.jl")
 include("core/types.jl")
@@ -88,6 +93,8 @@ include("form/lrd.jl")
 include("prob/wf.jl")
 include("prob/owf.jl")
 include("prob/des.jl")
+include("prob/mdd.jl")
+include("prob/ne.jl")
 
 include("util/relax.jl")
 include("util/variable_index.jl")
@@ -98,6 +105,7 @@ include("util/obbt.jl")
 # Deprecated functions.
 include("deprecated.jl")
 
+println("Test - WM - SK")
 # This must be included last to support automated export.
 include("core/export.jl")
 

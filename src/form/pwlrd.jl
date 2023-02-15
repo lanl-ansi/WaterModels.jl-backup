@@ -1,5 +1,5 @@
 # Define common PWLRD (piecewise linear relaxation- and direction-based) implementations of water
-# distribution network constraints, which use directed flow variables.
+# distribution network constraints, which use directed flow variables (i.e., `qp` and `qn`).
 
 
 ########################################## VARIABLES ##########################################
@@ -7,7 +7,7 @@
 
 "Create flow-related variables common to all directed flow models for node-connecting components."
 function variable_flow(wm::AbstractPWLRDModel; nw::Int=nw_id_default, bounded::Bool=true, report::Bool=true)
-    for name in ["des_pipe", "pipe", "pump", "regulator", "short_pipe", "valve"]
+    for name in _LINK_COMPONENTS
         # Create directed flow (`qp` and `qn`) variables for each component.
         _variable_component_flow(wm, name; nw = nw, bounded = bounded, report = report)
 
@@ -116,7 +116,8 @@ function constraint_pipe_head_loss(
     # Add constraints for the positive flow piecewise approximation.
     c_1 = JuMP.@constraint(wm.model, sum(lambda_p[a, k] for k in bp_range) == y)
     qp_sum = sum(partition_p[k] * lambda_p[a, k] for k in bp_range)
-    c_2 = JuMP.@constraint(wm.model, qp_sum == qp)
+    scalar = _get_scaling_factor(vcat(qp_sum.terms.vals, [1.0]))
+    c_2 = JuMP.@constraint(wm.model, scalar * qp_sum == scalar * qp)
     append!(con(wm, n, :pipe_head_loss, a), [c_1, c_2])
 
     if length(partition_p) > 1
@@ -128,17 +129,27 @@ function constraint_pipe_head_loss(
     end
 
     # Add a constraint that upper-bounds the head loss variable.
-    f_p = r .* partition_p.^exponent
-    f_p_ub_expr = sum(f_p[k] * lambda_p[a, k] for k in bp_range)
-    c_6 = JuMP.@constraint(wm.model, dhp / L <= f_p_ub_expr)
-    append!(con(wm, n, :pipe_head_loss, a), [c_6])
+    if maximum(partition_p) != 0.0
+        f_p = r * partition_p.^exponent
+        f_p_ub_expr = sum(f_p[k] * lambda_p[a, k] for k in bp_range)
+        scalar = _get_scaling_factor(vcat(f_p_ub_expr.terms.vals, [1.0 / L]))
+        c_6 = JuMP.@constraint(wm.model, scalar * dhp / L <= scalar * f_p_ub_expr)
+        append!(con(wm, n, :pipe_head_loss, a), [c_6])
+    else
+        c_6 = JuMP.@constraint(wm.model, dhp == 0.0)
+        append!(con(wm, n, :pipe_head_loss, a), [c_6])
+    end
 
     # Loop over consequential points (i.e., those that have nonzero head loss).
     for flow_value in filter(x -> x > 0.0, partition_p)
         # Add head loss outer (i.e., lower) approximations.
-        lhs_p = _calc_head_loss_oa(qp, y, flow_value, exponent)
-        c_7 = JuMP.@constraint(wm.model, r * lhs_p <= dhp / L)
-        append!(con(wm, n, :pipe_head_loss, a), [c_7])
+        lhs_p = r * _calc_head_loss_oa(qp, y, flow_value, exponent)
+        
+        if minimum(abs.(lhs_p.terms.vals)) >= 1.0e-4
+            scalar = _get_scaling_factor(vcat(lhs_p.terms.vals, [1.0 / L]))
+            c_7 = JuMP.@constraint(wm.model, scalar * lhs_p <= scalar * dhp / L)
+            append!(con(wm, n, :pipe_head_loss, a), [c_7])
+        end
     end
 
     for k in 2:length(partition_p)-1
@@ -160,7 +171,8 @@ function constraint_pipe_head_loss(
     # Add constraints for the negative flow piecewise approximation.
     c_9 = JuMP.@constraint(wm.model, sum(lambda_n[a, k] for k in bn_range) == 1.0 - y)
     qn_sum = sum(partition_n[k] * lambda_n[a, k] for k in bn_range)
-    c_10 = JuMP.@constraint(wm.model, qn_sum == qn)
+    scalar = _get_scaling_factor(vcat(qn_sum.terms.vals, [1.0]))
+    c_10 = JuMP.@constraint(wm.model, scalar * qn_sum == scalar * qn)
     append!(con(wm, n, :pipe_head_loss, a), [c_9, c_10])
 
     if length(partition_n) > 1
@@ -172,17 +184,27 @@ function constraint_pipe_head_loss(
     end
     
     # Add a constraint that upper-bounds the head loss variable.
-    f_n = r .* partition_n.^exponent
-    f_n_ub_expr = sum(f_n[k] * lambda_n[a, k] for k in bn_range)
-    c_14 = JuMP.@constraint(wm.model, dhn / L <= f_n_ub_expr)
-    append!(con(wm, n, :pipe_head_loss, a), [c_14])
+    if maximum(partition_n) != 0.0
+        f_n = r .* partition_n.^exponent
+        f_n_ub_expr = sum(f_n[k] * lambda_n[a, k] for k in bn_range)
+        scalar = _get_scaling_factor(vcat(f_n_ub_expr.terms.vals, [1.0 / L]))
+        c_14 = JuMP.@constraint(wm.model, scalar * dhn / L <= scalar * f_n_ub_expr)
+        append!(con(wm, n, :pipe_head_loss, a), [c_14])
+    else
+        c_14 = JuMP.@constraint(wm.model, dhn == 0.0)
+        append!(con(wm, n, :pipe_head_loss, a), [c_14])
+    end
 
     # Loop over consequential points (i.e., those that have nonzero head loss).
     for flow_value in filter(x -> x > 0.0, partition_n)
         # Add head loss outer (i.e., lower) approximations.
-        lhs_n = _calc_head_loss_oa(qn, 1.0 - y, flow_value, exponent)
-        c_15 = JuMP.@constraint(wm.model, r * lhs_n <= dhn / L)
-        append!(con(wm, n, :pipe_head_loss, a), [c_15])
+        lhs_n = r * _calc_head_loss_oa(qn, 1.0 - y, flow_value, exponent)
+
+        if minimum(abs.(lhs_n.terms.vals)) >= 1.0e-4
+            scalar = _get_scaling_factor(vcat(lhs_n.terms.vals, [1.0 / L]))
+            c_15 = JuMP.@constraint(wm.model, scalar * lhs_n <= scalar * dhn / L)
+            append!(con(wm, n, :pipe_head_loss, a), [c_15])
+        end
     end
 
     for k in 2:length(partition_n)-1
@@ -212,7 +234,8 @@ function constraint_on_off_des_pipe_head_loss(
     # Add constraints for the positive flow piecewise approximation.
     c_1 = JuMP.@constraint(wm.model, sum(lambda_p[a, k] for k in bp_range) <= y)
     qp_sum = sum(partition_p[k] * lambda_p[a, k] for k in bp_range)
-    c_2 = JuMP.@constraint(wm.model, qp_sum == qp)
+    scalar = _get_scaling_factor(vcat(qp_sum.terms.vals, [1.0]))
+    c_2 = JuMP.@constraint(wm.model, scalar * qp_sum == scalar * qp)
     append!(con(wm, n, :on_off_des_pipe_head_loss, a), [c_1, c_2])
 
     if length(partition_p) > 1
@@ -226,16 +249,20 @@ function constraint_on_off_des_pipe_head_loss(
     # Add a constraint that upper-bounds the head loss variable.
     f_p = r .* partition_p.^exponent
     f_p_ub_expr = sum(f_p[k] * lambda_p[a, k] for k in bp_range)
-    c_6 = JuMP.@constraint(wm.model, dhp / L <= f_p_ub_expr)
+    scalar = _get_scaling_factor(vcat(f_p_ub_expr.terms.vals, [1.0 / L]))
+    c_6 = JuMP.@constraint(wm.model, scalar * dhp / L <= scalar * f_p_ub_expr)
     append!(con(wm, n, :on_off_des_pipe_head_loss, a), [c_6])
 
     # Loop over consequential points (i.e., those that have nonzero head loss).
     for flow_value in filter(x -> x > 0.0, partition_p)
         # Add head loss outer (i.e., lower) approximations.
-        lhs_p_1 = _calc_head_loss_oa(qp, y, flow_value, exponent)
-        c_7 = JuMP.@constraint(wm.model, r * lhs_p_1 <= dhp / L)
-        lhs_p_2 = _calc_head_loss_oa(qp, z, flow_value, exponent)
-        c_8 = JuMP.@constraint(wm.model, r * lhs_p_2 <= dhp / L)
+        lhs_p_1 = r * _calc_head_loss_oa(qp, y, flow_value, exponent)
+        scalar = _get_scaling_factor(vcat(lhs_p_1.terms.vals, [1.0 / L]))
+        c_7 = JuMP.@constraint(wm.model, scalar * lhs_p_1 <= scalar * dhp / L)
+
+        lhs_p_2 = r * _calc_head_loss_oa(qp, z, flow_value, exponent)
+        scalar = _get_scaling_factor(vcat(lhs_p_2.terms.vals, [1.0 / L]))
+        c_8 = JuMP.@constraint(wm.model, scalar * lhs_p_2 <= scalar * dhp / L)
         append!(con(wm, n, :on_off_des_pipe_head_loss, a), [c_7, c_8])
     end
 
@@ -258,7 +285,8 @@ function constraint_on_off_des_pipe_head_loss(
     # Add constraints for the negative flow piecewise approximation.
     c_10 = JuMP.@constraint(wm.model, sum(lambda_n[a, k] for k in bn_range) <= 1.0 - y)
     qn_sum = sum(partition_n[k] * lambda_n[a, k] for k in bn_range)
-    c_11 = JuMP.@constraint(wm.model, qn_sum == qn)
+    scalar = _get_scaling_factor(vcat(qn_sum.terms.vals, [1.0]))
+    c_11 = JuMP.@constraint(wm.model, scalar * qn_sum == scalar * qn)
     append!(con(wm, n, :on_off_des_pipe_head_loss, a), [c_10, c_11])
 
     if length(partition_n) > 1
@@ -272,16 +300,21 @@ function constraint_on_off_des_pipe_head_loss(
     # Add a constraint that upper-bounds the head loss variable.
     f_n = r .* partition_n.^exponent
     f_n_ub_expr = sum(f_n[k] * lambda_n[a, k] for k in bn_range)
-    c_15 = JuMP.@constraint(wm.model, dhn / L <= f_n_ub_expr)
+    scalar = _get_scaling_factor(vcat(f_n_ub_expr.terms.vals, [1.0 / L]))
+    c_15 = JuMP.@constraint(wm.model, scalar * dhn / L <= scalar * f_n_ub_expr)
     append!(con(wm, n, :on_off_des_pipe_head_loss, a), [c_15])
 
     # Loop over consequential points (i.e., those that have nonzero head loss).
     for flow_value in filter(x -> x > 0.0, partition_n)
         # Add head loss outer (i.e., lower) approximations.
-        lhs_n_1 = _calc_head_loss_oa(qn, 1.0 - y, flow_value, exponent)
-        c_16 = JuMP.@constraint(wm.model, r * lhs_n_1 <= dhn / L)
-        lhs_n_2 = _calc_head_loss_oa(qn, z, flow_value, exponent)
-        c_17 = JuMP.@constraint(wm.model, r * lhs_n_2 <= dhn / L)
+        lhs_n_1 = r * _calc_head_loss_oa(qn, 1.0 - y, flow_value, exponent)
+        scalar = _get_scaling_factor(vcat(lhs_n_1.terms.vals, [1.0 / L]))
+        c_16 = JuMP.@constraint(wm.model, scalar * lhs_n_1 <= scalar * dhn / L)
+
+        lhs_n_2 = r * _calc_head_loss_oa(qn, z, flow_value, exponent)
+        scalar = _get_scaling_factor(vcat(lhs_n_2.terms.vals, [1.0 / L]))
+        c_17 = JuMP.@constraint(wm.model, scalar * lhs_n_2 <= scalar * dhn / L)
+        
         append!(con(wm, n, :on_off_des_pipe_head_loss, a), [c_16, c_17])
     end
 
@@ -327,16 +360,18 @@ function constraint_on_off_pump_head_gain(wm::AbstractPWLRDModel, n::Int, a::Int
 
     # Add a constraint for the flow piecewise approximation.
     qp_lhs = sum(partition[k] * lambda[a, k] for k in bp_range)
-    c_5 = JuMP.@constraint(wm.model, qp_lhs == qp)
+    scalar = _get_scaling_factor(vcat(qp_lhs.terms.vals, [1.0]))
+    c_5 = JuMP.@constraint(wm.model, scalar * qp_lhs == scalar * qp)
 
     # Get pump head curve function and its derivative.
     head_curve_function = ref(wm, n, :pump, a, "head_curve_function")
     head_curve_derivative = ref(wm, n, :pump, a, "head_curve_derivative")
 
     # Add a constraint that lower-bounds the head gain variable.
-    f_all = head_curve_function.(partition)
+    f_all = map(x -> x = x < 0.0 ? 0.0 : x, head_curve_function.(partition))
     gain_lb_expr = sum(f_all[k] .* lambda[a, k] for k in bp_range)
-    c_6 = JuMP.@constraint(wm.model, gain_lb_expr <= g)
+    scalar = _get_scaling_factor(vcat(gain_lb_expr.terms.vals, [1.0]))
+    c_6 = JuMP.@constraint(wm.model, scalar * gain_lb_expr <= scalar * g)
 
     # Append the constraint array.
     append!(con(wm, n, :on_off_pump_head_gain, a), [c_1, c_2, c_3, c_4, c_5, c_6])
@@ -345,9 +380,13 @@ function constraint_on_off_pump_head_gain(wm::AbstractPWLRDModel, n::Int, a::Int
         # Add head gain outer (i.e., upper) approximations.
         f = head_curve_function(flow_value)
         df = head_curve_derivative(flow_value)
-        f_rhs = f * z + df * (qp - flow_value * z)
-        c = JuMP.@constraint(wm.model, g <= f_rhs)
-        append!(con(wm, n, :on_off_pump_head_gain, a), [c])
+
+        if abs(df) >= 1.0e-4 # Only add an outer-approximation if the derivative isn't too small.
+            f_rhs = f * z + df * (qp - flow_value * z)
+            scalar = _get_scaling_factor(vcat(f_rhs.terms.vals, [1.0]))
+            c = JuMP.@constraint(wm.model, scalar * g <= scalar * f_rhs)
+            append!(con(wm, n, :on_off_pump_head_gain, a), [c])
+        end
     end
 
     for k in 2:length(partition)-1
@@ -369,15 +408,20 @@ function constraint_on_off_pump_power(wm::AbstractPWLRDModel, n::Int, a::Int, q_
     bp_range = 1:length(partition)
     
     # Add a constraint that lower-bounds the power variable.
-    f_ua = _calc_pump_power_ua(wm, n, a, partition)
-    power_lb_expr = sum(f_ua[k] * lambda[a, k] for k in bp_range)
-    c_1 = JuMP.@constraint(wm.model, power_lb_expr <= P)
+    if minimum(partition) == 0.0 && maximum(partition) == 0.0
+        c_1 = JuMP.@constraint(wm.model, P == 0.0)
+        append!(con(wm, n, :on_off_pump_power)[a], [c_1])
+    else
+        f_ua = _calc_pump_power_ua(wm, n, a, partition)
+        power_lb_expr = sum(f_ua[k] * lambda[a, k] for k in bp_range)
+        c_1 = JuMP.@constraint(wm.model, power_lb_expr <= P)
 
-    # Add a constraint that upper-bounds the power variable.
-    f_oa = _calc_pump_power_oa(wm, n, a, partition)
-    power_ub_expr = sum(f_oa[k] * lambda[a, k] for k in bp_range)
-    c_2 = JuMP.@constraint(wm.model, P <= power_ub_expr)
+        # Add a constraint that upper-bounds the power variable.
+        f_oa = _calc_pump_power_oa(wm, n, a, partition)
+        power_ub_expr = sum(f_oa[k] * lambda[a, k] for k in bp_range)
+        c_2 = JuMP.@constraint(wm.model, P <= power_ub_expr)
 
-    # Append the :on_off_pump_power constraint array.
-    append!(con(wm, n, :on_off_pump_power)[a], [c_1, c_2])
+        # Append the :on_off_pump_power constraint array.
+        append!(con(wm, n, :on_off_pump_power)[a], [c_1, c_2])
+    end
 end

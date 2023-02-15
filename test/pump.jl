@@ -1,6 +1,6 @@
 @testset "src/core/pump.jl" begin
-    for head_curve_form in [PUMP_QUADRATIC, PUMP_BEST_EFFICIENCY_POINT, PUMP_EPANET, PUMP_LINEAR_POWER]
-        @testset "pump with efficiency curve: $(head_curve_form)" begin
+    for pump_type in [PUMP_QUADRATIC, PUMP_BEST_EFFICIENCY_POINT, PUMP_EPANET, PUMP_LINEAR_POWER]
+        @testset "pump of type: $(pump_type)" begin
             # Read in the initial network data and ensure an efficiency curve exists.
             network_path = "../test/data/epanet/snapshot/pump-hw-lps-eff-curve.inp"
             network = WaterModels.parse_file(network_path)
@@ -21,7 +21,7 @@
             map(x -> x["power_per_unit_flow"] = expected_val, values(network["pump"]))
 
             # Change the head curve form and recompute network bounds.
-            map(x -> x["head_curve_form"] = head_curve_form, values(network["pump"]))
+            map(x -> x["pump_type"] = pump_type, values(network["pump"]))
             WaterModels.recompute_bounds!(network)
 
             # Set up and solve an optimization problem with the pump data.
@@ -30,5 +30,12 @@
             result = WaterModels.optimize_model!(wm, optimizer = _choose_solver(wm, nlp_solver, milp_solver))
             @test _is_valid_status(result["termination_status"])
         end
+    end
+
+    @testset "error when building nonconvex model with PUMP_EPANET" begin
+        network_path = "../test/data/epanet/snapshot/pump-hw-lps-eff-curve.inp"
+        network = WaterModels.parse_file(network_path)
+        map(x -> x["pump_type"] = PUMP_EPANET, values(network["pump"]))
+        @test_throws ErrorException instantiate_model(network, NCWaterModel, build_wf)
     end
 end

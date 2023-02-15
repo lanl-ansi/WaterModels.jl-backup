@@ -1,5 +1,4 @@
-WaterModels.jl Change Log
-=========================
+# WaterModels.jl Changelog
 
 ### Staged
 - nothing

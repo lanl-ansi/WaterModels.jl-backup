@@ -1,23 +1,32 @@
-function aggregate_pumps(subnetworks::Array{Dict{String, Any}, 1})
-    pumps = deepcopy(subnetworks[1]["pump"])
+function correct_pumps!(data::Dict{String, <:Any})
+    wm_data = get_wm_data(data)
 
-    for (i, x) in pumps
-        x["flow_min"] = sum_subnetwork_values(subnetworks, "pump", i, "flow_min")
-        x["flow_max"] = sum_subnetwork_values(subnetworks, "pump", i, "flow_max")
-        x["flow_min_forward"] = sum_subnetwork_values(subnetworks, "pump", i, "flow_min_forward")
-        x["status"] = any_subnetwork_values(subnetworks, "pump", i, "status")
-        x["energy_price"] = max_subnetwork_values(subnetworks, "pump", i, "energy_price")
+    if wm_data["per_unit"]
+        flow_transform = _calc_flow_per_unit_transform(wm_data)
+        flow_epsilon = flow_transform(_FLOW_MIN)
+        func = x -> _correct_pumps!(x, flow_epsilon)
+    else
+        func = x -> _correct_pumps!(x, _FLOW_MIN)
     end
 
-    return pumps
+    apply_wm!(func, data; apply_to_subnetworks = true)
 end
 
+function correct_ne_pumps!(data::Dict{String, <:Any})
+    wm_data = get_wm_data(data)
 
-function correct_pumps!(data::Dict{String, <:Any})
-    apply_wm!(_correct_pumps!, data; apply_to_subnetworks = true)
+    if wm_data["per_unit"]
+        flow_transform = _calc_flow_per_unit_transform(wm_data)
+        flow_epsilon = flow_transform(_FLOW_MIN)
+        func = x -> _correct_ne_pumps!(x, flow_epsilon)
+    else
+        func = x -> _correct_ne_pumps!(x, _FLOW_MIN)
+    end
+
+    apply_wm!(func, data; apply_to_subnetworks = true)
 end
 
-function _correct_pumps!(data::Dict{String, <:Any})
+function _correct_pumps!(data::Dict{String, <:Any}, flow_epsilon::Float64)
     for (idx, pump) in data["pump"]
         # Get common connecting node data for later use.
         node_fr = data["node"][string(pump["node_fr"])]
@@ -26,11 +35,32 @@ function _correct_pumps!(data::Dict{String, <:Any})
         # Correct various pump properties. The sequence is important, here.
         _correct_status!(pump)
         _correct_flow_direction!(pump)
-        _correct_pump_head_curve_form!(pump)
-        _correct_pump_flow_bounds!(pump, node_fr, node_to)
+        _correct_pump_type!(pump)
+        _correct_pump_flow_bounds!(pump, node_fr, node_to, flow_epsilon)
     end
 end
 
+function _correct_ne_pumps!(data::Dict{String, <:Any}, flow_epsilon::Float64)
+    for (idx, pump) in data["ne_pump"]
+        # Get common connecting node data for later use.
+        node_fr = data["node"][string(pump["node_fr"])]
+        node_to = data["node"][string(pump["node_to"])]
+
+        # Correct various expansion pump properties. The sequence is important, here.
+        _correct_ne_pump_data!(pump)
+        _correct_status!(pump)
+        _correct_flow_direction!(pump)
+        _correct_pump_type!(pump)
+        _correct_pump_flow_bounds!(pump, node_fr, node_to, flow_epsilon)
+    end
+end
+
+function _correct_ne_pump_data!(ne_pump:: Dict{String, <:Any})
+    ne_pump["head_curve"] = eval(Meta.parse(ne_pump["head_curve"]))
+    ne_pump["pump_type"] = eval(Meta.parse(ne_pump["pump_type"]))
+    ne_pump["status"] = eval(Meta.parse(ne_pump["status"]))
+    ne_pump["flow_direction"] = eval(Meta.parse(ne_pump["flow_direction"]))
+end
 
 function set_pump_flow_partition!(
     pump::Dict{String, <:Any}, error_tolerance::Float64, length_tolerance::Float64)
@@ -52,33 +82,72 @@ function set_pump_flow_partition!(
 end
 
 
-function correct_pump_head_curve_forms!(data::Dict{String,<:Any})
-    apply_wm!(_correct_pump_head_curve_forms!, data; apply_to_subnetworks = true)
+function correct_pump_types!(data::Dict{String,<:Any})
+    apply_wm!(_correct_pump_types!, data; apply_to_subnetworks = true)
 end
 
 
-function _correct_pump_head_curve_forms!(data::Dict{String,<:Any})
+function correct_ne_pump_types!(data::Dict{String,<:Any})
+    apply_wm!(_correct_ne_pump_types!, data; apply_to_subnetworks = true)
+end
+
+
+function _correct_pump_types!(data::Dict{String,<:Any})
     components = values(get(data, "pump", Dict{String,Any}()))
-    _correct_pump_head_curve_form!.(components)
+    _correct_pump_type!.(components)
+end
+
+function _correct_ne_pump_types!(data::Dict{String,<:Any})
+    components = values(get(data, "ne_pump", Dict{String,Any}()))
+    _correct_ne_pump_type!.(components)
 end
 
 
-function _correct_pump_head_curve_form!(pump::Dict{String, <:Any})
-    head_curve_tmp = get(pump, "head_curve_form", PUMP_QUADRATIC)
+function _correct_pump_type!(pump::Dict{String, <:Any})
+    head_curve_tmp = get(pump, "pump_type", PUMP_QUADRATIC)
 
     if isa(head_curve_tmp, PUMP)
-        pump["head_curve_form"] = head_curve_tmp
+        pump["pump_type"] = head_curve_tmp
     else
-        pump["head_curve_form"] = PUMP(head_curve_tmp)
+        pump["pump_type"] = PUMP(head_curve_tmp)
+    end
+end
+
+function _correct_ne_pump_type!(ne_pump::Dict{String, <:Any})
+    head_curve_tmp = get(ne_pump, "pump_type", PUMP_QUADRATIC)
+
+    if isa(head_curve_tmp, PUMP)
+        ne_pump["pump_type"] = head_curve_tmp
+    else
+        ne_pump["pump_type"] = PUMP(head_curve_tmp)
     end
 end
 
 
-function _correct_pump_flow_bounds!(pump::Dict{String, <:Any}, node_fr::Dict{String, <:Any}, node_to::Dict{String, <:Any})
-    pump["flow_min"] = _calc_pump_flow_min(pump, node_fr, node_to)
-    pump["flow_max"] = _calc_pump_flow_max(pump, node_fr, node_to)
-    pump["flow_min_forward"] = _calc_pump_flow_min_forward(pump, node_fr, node_to)
-    pump["flow_max_reverse"] = _calc_pump_flow_max_reverse(pump, node_fr, node_to)
+function _correct_pump_flow_bounds!(pump::Dict{String, <:Any}, node_fr::Dict{String, <:Any}, node_to::Dict{String, <:Any}, flow_epsilon::Float64)
+    if get(pump, "z_max", 1.0) == 0.0
+        pump["flow_min"] = 0.0
+        pump["flow_max"] = 0.0
+        pump["flow_min_forward"] = 0.0
+        pump["flow_max_reverse"] = 0.0
+    else
+        pump["flow_min"] = max(0.0, _calc_pump_flow_min(pump, node_fr, node_to))
+        pump["flow_max"] = max(0.0, _calc_pump_flow_max(pump, node_fr, node_to))
+        pump["flow_min_forward"] = max(0.0, max(pump["flow_min"], _calc_pump_flow_min_forward(pump, node_fr, node_to, flow_epsilon)))
+        pump["flow_min_forward"] = min(pump["flow_max"], pump["flow_min_forward"])
+        pump["flow_max_reverse"] = max(0.0, min(pump["flow_max"], _calc_pump_flow_max_reverse(pump, node_fr, node_to)))
+    end
+
+    pump["flow_max"] = max(pump["flow_min"], pump["flow_max"])
+    pump["flow_min"] = min(pump["flow_min"], pump["flow_max"])
+    pump["flow_min_forward"] = max(pump["flow_min_forward"], pump["flow_min"])
+    pump["flow_min_forward"] = min(pump["flow_min_forward"], pump["flow_max"])
+    pump["flow_max_reverse"] = min(pump["flow_max_reverse"], pump["flow_max"])
+    pump["flow_max_reverse"] = max(pump["flow_max_reverse"], pump["flow_min"])
+
+    @assert pump["flow_min"] <= pump["flow_max"]
+    @assert get(pump, "flow_min_forward", 0.0) <= max(0.0, pump["flow_max"])
+    @assert min(0.0, pump["flow_min"]) <= get(pump, "flow_max_reverse", 0.0)
 end
 
 
@@ -87,8 +156,8 @@ function _calc_pump_flow_min(pump::Dict{String, <:Any}, node_fr::Dict{String, <:
 end
 
 
-function _calc_pump_flow_min_forward(pump::Dict{String, <:Any}, node_fr::Dict{String,<: Any}, node_to::Dict{String, <:Any})
-    flow_min_forward = get(pump, "flow_min_forward", _FLOW_MIN)
+function _calc_pump_flow_min_forward(pump::Dict{String, <:Any}, node_fr::Dict{String,<: Any}, node_to::Dict{String, <:Any}, flow_epsilon::Float64)
+    flow_min_forward = get(pump, "flow_min_forward", flow_epsilon)
     return max(_calc_pump_flow_min(pump, node_fr, node_to), flow_min_forward)
 end
 
@@ -103,10 +172,10 @@ function _calc_pump_head_gain_max(pump::Dict{String, <:Any}, node_fr::Dict{Strin
     # Calculate the flow at the maximum head gain, then return maximum head gain.
     c = _calc_head_curve_coefficients(pump)
 
-    if pump["head_curve_form"] in [PUMP_QUADRATIC, PUMP_BEST_EFFICIENCY_POINT, PUMP_LINEAR_POWER]
+    if pump["pump_type"] in [PUMP_QUADRATIC, PUMP_BEST_EFFICIENCY_POINT]
         flow_at_max = -c[2] * inv(2.0 * c[1]) > 0.0 ? -c[2] * inv(2.0 * c[1]) : 0.0
         return max(0.0, c[1] * flow_at_max^2 + c[2] * flow_at_max + c[3])
-    elseif pump["head_curve_form"] == PUMP_EPANET
+    elseif pump["pump_type"] in [PUMP_EPANET, PUMP_LINEAR_POWER]
         return max(0.0, c[1])
     end
 end
@@ -116,7 +185,7 @@ function _calc_pump_flow_max(pump::Dict{String,<:Any}, node_fr::Dict{String,Any}
     # Get possible maximal flow values based on the head curve.
     c = _calc_head_curve_coefficients(pump)
 
-    if pump["head_curve_form"] in [PUMP_QUADRATIC, PUMP_BEST_EFFICIENCY_POINT, PUMP_LINEAR_POWER]
+    if pump["pump_type"] in [PUMP_QUADRATIC, PUMP_BEST_EFFICIENCY_POINT]
         q_max_1 = (-c[2] + sqrt(c[2]^2 - 4.0*c[1]*c[3])) * inv(2.0 * c[1])
         q_max_2 = (-c[2] - sqrt(c[2]^2 - 4.0*c[1]*c[3])) * inv(2.0 * c[1])
 
@@ -127,7 +196,7 @@ function _calc_pump_flow_max(pump::Dict{String,<:Any}, node_fr::Dict{String,Any}
 
         # Get the minimal value of the above and the possible "flow_max" value.
         return min(max(q_max_1, q_max_2), max(q_max_3, q_max_4), get(pump, "flow_max", Inf))
-    elseif pump["head_curve_form"] == PUMP_EPANET
+    elseif pump["pump_type"] in [PUMP_EPANET, PUMP_LINEAR_POWER]
         return min((-c[1] * inv(c[2]))^(inv(c[3])), get(pump, "flow_max", Inf))
     end
 end
@@ -155,75 +224,77 @@ end
 
 
 function _calc_head_curve_coefficients(pump::Dict{String, <:Any})
-    if pump["head_curve_form"] in [PUMP_QUADRATIC, PUMP_LINEAR_POWER]
+    if pump["pump_type"] == PUMP_QUADRATIC
         return _calc_head_curve_coefficients_quadratic(pump)
-    elseif pump["head_curve_form"] == PUMP_BEST_EFFICIENCY_POINT
+    elseif pump["pump_type"] == PUMP_BEST_EFFICIENCY_POINT
         return _calc_head_curve_coefficients_best_efficiency_point(pump)
-    elseif pump["head_curve_form"] == PUMP_EPANET
+    elseif pump["pump_type"] in [PUMP_EPANET, PUMP_LINEAR_POWER]
         return _calc_head_curve_coefficients_epanet(pump)
     else
-        error("\"$(pump["head_curve_form"])\" is not a valid head curve formulation.")
+        error("\"$(pump["pump_type"])\" is not a valid head curve formulation.")
     end
 end
 
 
 function _calc_head_curve_function(pump::Dict{String, <:Any})
-    if pump["head_curve_form"] in [PUMP_QUADRATIC, PUMP_LINEAR_POWER]
+    if pump["pump_type"] == PUMP_QUADRATIC
         coeff = _calc_head_curve_coefficients_quadratic(pump)
         return x -> sum(coeff .* [x^2, x, 1.0])
-    elseif pump["head_curve_form"] == PUMP_BEST_EFFICIENCY_POINT
+    elseif pump["pump_type"] == PUMP_BEST_EFFICIENCY_POINT
         coeff = _calc_head_curve_coefficients_best_efficiency_point(pump)
         return x -> sum(coeff .* [x^2, x, 1.0])
-    elseif pump["head_curve_form"] == PUMP_EPANET
+    elseif pump["pump_type"] in [PUMP_EPANET, PUMP_LINEAR_POWER]
         coeff = _calc_head_curve_coefficients_epanet(pump)
         return x -> coeff[1] + coeff[2] * x^coeff[3]
     else
-        error("\"$(pump["head_curve_form"])\" is not a valid head curve formulation.")
+        error("\"$(pump["pump_type"])\" is not a valid head curve formulation.")
     end
 end
 
 
 function _calc_head_curve_function(pump::Dict{String, <:Any}, z::JuMP.VariableRef)
-    if pump["head_curve_form"] in [PUMP_QUADRATIC, PUMP_LINEAR_POWER]
+    if pump["pump_type"] == PUMP_QUADRATIC
         coeff = _calc_head_curve_coefficients_quadratic(pump)
         return x -> sum(coeff .* [x^2, x, z])
-    elseif pump["head_curve_form"] == PUMP_BEST_EFFICIENCY_POINT
+    elseif pump["pump_type"] == PUMP_BEST_EFFICIENCY_POINT
         coeff = _calc_head_curve_coefficients_best_efficiency_point(pump)
         return x -> sum(coeff .* [x^2, x, z])
-    elseif pump["head_curve_form"] == PUMP_EPANET
+    elseif pump["pump_type"] in [PUMP_EPANET, PUMP_LINEAR_POWER]
         coeff = _calc_head_curve_coefficients_epanet(pump)
         return x -> coeff[1] * z + coeff[2] * x^coeff[3]
     else
-        error("\"$(pump["head_curve_form"])\" is not a valid head curve formulation.")
+        error("\"$(pump["pump_type"])\" is not a valid head curve formulation.")
     end
 end
 
 function _calc_head_curve_derivative(pump::Dict{String, <:Any})
-    if pump["head_curve_form"] in [PUMP_QUADRATIC, PUMP_LINEAR_POWER]
+    if pump["pump_type"] == PUMP_QUADRATIC
         coeff = _calc_head_curve_coefficients_quadratic(pump)
         return x -> sum(coeff .* [2.0 * x, 1.0, 0.0])
-    elseif pump["head_curve_form"] == PUMP_BEST_EFFICIENCY_POINT
+    elseif pump["pump_type"] == PUMP_BEST_EFFICIENCY_POINT
         coeff = _calc_head_curve_coefficients_best_efficiency_point(pump)
         return x -> sum(coeff .* [2.0 * x, 1.0, 0.0])
-    elseif pump["head_curve_form"] == PUMP_EPANET
+    elseif pump["pump_type"] in [PUMP_EPANET, PUMP_LINEAR_POWER]
         coeff = _calc_head_curve_coefficients_epanet(pump)
         return x -> coeff[2] * coeff[3] * x^(coeff[3] - 1.0)
     else
-        error("\"$(pump["head_curve_form"])\" is not a valid head curve formulation.")
+        error("\"$(pump["pump_type"])\" is not a valid head curve formulation.")
     end
 end
 
 
 function _calc_head_curve_coefficients_epanet(pump::Dict{String, <:Any})
-    a = pump["head_curve"][1][2]
-    h4 = pump["head_curve"][1][2] - pump["head_curve"][2][2]
-    h5 = pump["head_curve"][1][2] - pump["head_curve"][3][2]
-    q1, q2 = pump["head_curve"][2][1], pump["head_curve"][3][1]
+    # Use LsqFit to compute a fit with respect to points on the head curve.
+    q, h = [x[1] for x in pump["head_curve"]], [x[2] for x in pump["head_curve"]]
+    model_function(x, p) = p[1] .+ p[2] .* x.^p[3] # (i.e., a + b * x^c)
+    params = LsqFit.curve_fit(model_function, q, h, [h[1], -1.0, 2.0];
+        lower = [0.0, -Inf, 1.0 + 1.0e-12], upper = [Inf, -1.0e-12, Inf]).param
 
-    c = log(h5 * inv(h4)) * inv(log(q2 * inv(q1)))
-    b = -h4 * inv(q1^c)
+    # Ensure the function is concave with a positive offset.
+    @assert params[1] > 0.0 && params[2] * (params[3]^2 - params[3]) < 0.0
 
-    return [a, b, c]
+    # Return the vector of function parameters.
+    return Vector{Float64}(params)
 end
 
 function _calc_head_curve_coefficients_quadratic(pump::Dict{String, <:Any})
@@ -357,11 +428,33 @@ function _calc_pump_power_points(wm::AbstractWaterModel, nw::Int, pump_id::Int, 
 
     wm_data = get_wm_data(wm.data)
     flow_transform = _calc_flow_per_unit_transform(wm_data)
-    q_min = max(get(pump, "flow_min_forward",
-        flow_transform(_FLOW_MIN)), flow_transform(_FLOW_MIN))
+    q_build = range(0.0, stop = pump["flow_max"] + 1.0e-7, length = num_points)
+    f_build = head_curve_function.(collect(q_build)) .* q_build
 
-    q_max = max(q_min, pump["flow_max"])
-    q_build = range(q_min - 1.0e-7, stop = q_max + 1.0e-7, length = num_points)
+    if haskey(pump, "efficiency_curve")
+        eff_curve = pump["efficiency_curve"]
+        eff = _calc_efficiencies(collect(q_build), eff_curve)
+    else
+        eff = pump["efficiency"]
+    end
+
+    base_mass = 1.0 / _calc_mass_per_unit_transform(wm_data)(1.0)
+    base_time = 1.0 / _calc_time_per_unit_transform(wm_data)(1.0)
+    base_length = 1.0 / _calc_length_per_unit_transform(wm_data)(1.0)
+    flow_transform = 1.0 / _calc_flow_per_unit_transform(wm_data)(1.0)
+
+    density = _calc_scaled_density(base_mass, base_length)
+    gravity = _calc_scaled_gravity(base_length, base_time)
+    return q_build, max.(0.0, density * gravity * inv.(eff) .* f_build)
+end
+
+function _calc_pump_power_points_ne(wm::AbstractWaterModel, nw::Int, pump_id::Int, num_points::Int)
+    pump = ref(wm, nw, :ne_pump, pump_id)
+    head_curve_function = ref(wm, nw, :ne_pump, pump_id, "head_curve_function")
+
+    wm_data = get_wm_data(wm.data)
+    flow_transform = _calc_flow_per_unit_transform(wm_data)
+    q_build = range(0.0, stop = pump["flow_max"] + 1.0e-7, length = num_points)
     f_build = head_curve_function.(collect(q_build)) .* q_build
 
     if haskey(pump, "efficiency_curve")
@@ -382,19 +475,54 @@ function _calc_pump_power_points(wm::AbstractWaterModel, nw::Int, pump_id::Int, 
 end
 
 
-function _calc_pump_power(wm::AbstractWaterModel, nw::Int, pump_id::Int, q::Array{Float64, 1})
+function _calc_pump_power(wm::AbstractWaterModel, nw::Int, pump_id::Int, q::Vector{Float64})
     q_true, f_true = _calc_pump_power_points(wm, nw, pump_id, 100)
     return max.(Interpolations.LinearInterpolation(q_true, f_true).(q), 0.0)
 end
 
+function _calc_pump_power_ne(wm::AbstractWaterModel, nw::Int, pump_id::Int, q::Vector{Float64})
+    q_true, f_true = _calc_pump_power_points_ne(wm, nw, pump_id, 100)
+    return max.(Interpolations.LinearInterpolation(q_true, f_true).(q), 0.0)
+end
 
 function _calc_pump_power_ua(wm::AbstractWaterModel, nw::Int, pump_id::Int, q::Vector{Float64})
     q_true, f_true = _calc_pump_power_points(wm, nw, pump_id, 100)
     f_interp = Interpolations.LinearInterpolation(q_true, f_true).(q)
 
     for i in 2:length(q)
-        slope = (f_interp[i] - f_interp[i-1]) * inv(q[i] - q[i-1])
-        true_ids = filter(x -> q_true[x] >= q[i-1] && q_true[x] <= q[i], 1:length(q_true))
+        # Find the indices that will be used in the approximation.
+        true_ids = filter(k -> q_true[k] >= q[i-1] && q_true[k] <= q[i], 1:length(q_true))
+
+        if length(true_ids) == 0
+            true_ids = filter(k -> q_true[k] >= q[i-1], 1:length(q_true))
+            true_ids = vcat(true_ids[1] - 1, true_ids[1])
+        end
+
+        # Shift the approximation by the maximum error, ensuring it's an underapproximation.
+        slope = (f_interp[i] - f_interp[i-1]) / (q[i] - q[i-1])
+        f_est_s = f_interp[i-1] .+ (slope .* (q_true[true_ids] .- q[i-1]))
+        est_err = max(0.0, maximum(f_est_s .- f_true[true_ids]))
+        f_interp[i-1:i] .-= est_err
+    end
+
+    return f_interp
+end
+
+function _calc_pump_power_ua_ne(wm::AbstractWaterModel, nw::Int, pump_id::Int, q::Vector{Float64})
+    q_true, f_true = _calc_pump_power_points_ne(wm, nw, pump_id, 100)
+    f_interp = Interpolations.LinearInterpolation(q_true, f_true).(q)
+
+    for i in 2:length(q)
+        # Find the indices that will be used in the approximation.
+        true_ids = filter(k -> q_true[k] >= q[i-1] && q_true[k] <= q[i], 1:length(q_true))
+
+        if length(true_ids) == 0
+            true_ids = filter(k -> q_true[k] >= q[i-1], 1:length(q_true))
+            true_ids = vcat(true_ids[1] - 1, true_ids[1])
+        end
+
+        # Shift the approximation by the maximum error, ensuring it's an underapproximation.
+        slope = (f_interp[i] - f_interp[i-1]) / (q[i] - q[i-1])
         f_est_s = f_interp[i-1] .+ (slope .* (q_true[true_ids] .- q[i-1]))
         est_err = max(0.0, maximum(f_est_s .- f_true[true_ids]))
         f_interp[i-1:i] .-= est_err
@@ -404,12 +532,27 @@ function _calc_pump_power_ua(wm::AbstractWaterModel, nw::Int, pump_id::Int, q::V
 end
 
 
-function _calc_pump_power_oa(wm::AbstractWaterModel, nw::Int, pump_id::Int, q::Array{Float64, 1})
+function _calc_pump_power_oa(wm::AbstractWaterModel, nw::Int, pump_id::Int, q::Vector{Float64})
     q_true, f_true = _calc_pump_power_points(wm, nw, pump_id, 100)
     f_interp = Interpolations.LinearInterpolation(q_true, f_true).(q)
 
     for i in 2:length(q)
-        slope = (f_interp[i] - f_interp[i-1]) * inv(q[i] - q[i-1])
+        slope = (f_interp[i] - f_interp[i-1]) / (q[i] - q[i-1])
+        true_ids = filter(x -> q_true[x] >= q[i-1] && q_true[x] <= q[i], 1:length(q_true))
+        f_est_s = f_interp[i-1] .+ (slope .* (q_true[true_ids] .- q[i-1]))
+        est_err = max(0.0, maximum(f_true[true_ids] .- f_est_s))
+        f_interp[i-1:i] .+= est_err
+    end
+
+    return f_interp
+end
+
+function _calc_pump_power_oa_ne(wm::AbstractWaterModel, nw::Int, pump_id::Int, q::Vector{Float64})
+    q_true, f_true = _calc_pump_power_points_ne(wm, nw, pump_id, 100)
+    f_interp = Interpolations.LinearInterpolation(q_true, f_true).(q)
+
+    for i in 2:length(q)
+        slope = (f_interp[i] - f_interp[i-1]) / (q[i] - q[i-1])
         true_ids = filter(x -> q_true[x] >= q[i-1] && q_true[x] <= q[i], 1:length(q_true))
         f_est_s = f_interp[i-1] .+ (slope .* (q_true[true_ids] .- q[i-1]))
         est_err = max(0.0, maximum(f_true[true_ids] .- f_est_s))
@@ -437,8 +580,24 @@ function _calc_pump_power_quadratic_approximation(wm::AbstractWaterModel, nw::In
     return x -> sum(linear_coefficients .* [x * x, x, z])
 end
 
+function _calc_pump_power_quadratic_approximation_ne(wm::AbstractWaterModel, nw::Int, pump_id::Int, z::JuMP.VariableRef)
+    # Get good approximations of pump flow and power points.
+    q_true, f_true = _calc_pump_power_points_ne(wm, nw, pump_id, 100)
 
-function _calc_efficiencies(points::Array{Float64}, curve::Vector{Tuple{Float64, Float64}})
+    # Build a two-dimensional array of the feature points.
+    q_array = hcat(q_true .* q_true, q_true, ones(length(q_true)))
+
+    # Obtain coefficients for the quadratic approximation from a least squares fit.
+    linear_coefficients = q_array \ f_true
+
+    # Ensure that a negative constant term does not exist.
+    linear_coefficients[3] = max(0.0, linear_coefficients[3])
+
+    # Return the least squares-fitted quadratic approximation.
+    return x -> sum(linear_coefficients .* [x * x, x, z])
+end
+
+function _calc_efficiencies(points::Vector{Float64}, curve::Vector{<:Any})
     q, eff = [[x[1] for x in curve], [x[2] for x in curve]]
     return Interpolations.LinearInterpolation(q, eff,
         extrapolation_bc=Interpolations.Flat()).(points)
@@ -449,8 +608,13 @@ function get_pump_flow_partition(pump::Dict{String, <:Any})
     @assert haskey(pump, "flow_partition")
     flows = filter(x -> x > 0.0, pump["flow_partition"])
     lower_bound = max(0.0, get(pump, "flow_min_forward", 0.0))
-    flow_max = length(flows) > 0 ? maximum(flows) : lower_bound
-    return lower_bound != flow_max ? vcat(lower_bound, flows) : [lower_bound]
+
+    if length(flows) > 0 && lower_bound == minimum(flows)
+        return flows
+    else
+        flow_max = length(flows) > 0 ? maximum(flows) : lower_bound
+        return lower_bound != flow_max ? vcat(lower_bound, flows) : [lower_bound]
+    end
 end
 
 
@@ -465,9 +629,60 @@ function set_pump_warm_start!(data::Dict{String, <:Any})
     apply_wm!(_set_pump_warm_start!, data)
 end
 
+function set_ne_pump_warm_start!(data::Dict{String, <:Any})
+    apply_wm!(_set_ne_pump_warm_start!, data)
+end
+
+
+function _relax_pumps!(data::Dict{String,<:Any})
+    if !_IM.ismultinetwork(data)
+        if haskey(data, "time_series") && haskey(data["time_series"], "pump")
+            ts = data["time_series"]["pump"]
+            pumps = values(filter(x -> x.first in keys(ts), data["pump"]))
+            map(x -> x["flow_min"] = minimum(ts[string(x["index"])]["flow_min"]), pumps)
+            map(x -> x["flow_min_forward"] = minimum(ts[string(x["index"])]["flow_min_forward"]), pumps)
+            map(x -> x["flow_max"] = maximum(ts[string(x["index"])]["flow_max"]), pumps)
+            map(x -> x["flow_max_reverse"] = maximum(ts[string(x["index"])]["flow_max_reverse"]), pumps)
+            map(x -> x["z_min"] = minimum(ts[string(x["index"])]["z_min"]), pumps)
+            map(x -> x["z_max"] = maximum(ts[string(x["index"])]["z_max"]), pumps)
+        end
+    end
+end
+
+function _relax_ne_pumps!(data::Dict{String,<:Any})
+    if !_IM.ismultinetwork(data)
+        if haskey(data, "time_series") && haskey(data["time_series"], "ne_pump")
+            ts = data["time_series"]["ne_pump"]
+            pumps = values(filter(x -> x.first in keys(ts), data["ne_pump"]))
+            map(x -> x["flow_min"] = minimum(ts[string(x["index"])]["flow_min"]), pumps)
+            map(x -> x["flow_min_forward"] = minimum(ts[string(x["index"])]["flow_min_forward"]), pumps)
+            map(x -> x["flow_max"] = maximum(ts[string(x["index"])]["flow_max"]), pumps)
+            map(x -> x["flow_max_reverse"] = maximum(ts[string(x["index"])]["flow_max_reverse"]), pumps)
+            map(x -> x["z_min"] = minimum(ts[string(x["index"])]["z_min"]), pumps)
+            map(x -> x["z_max"] = maximum(ts[string(x["index"])]["z_max"]), pumps)
+        end
+    end
+end
+
 
 function _set_pump_warm_start!(data::Dict{String, <:Any})
     for pump in values(data["pump"])
+        flow_mid = 0.5 * (pump["flow_min"] + pump["flow_max"])
+
+        pump["q_start"] = get(pump, "q", flow_mid)
+        pump["qp_start"] = max(0.0, get(pump, "q", flow_mid))
+        pump["qn_start"] = max(0.0, -get(pump, "q", flow_mid))
+
+        pump["g_pump_start"] = get(pump, "g", 0.0)
+        pump["P_pump_start"] = get(pump, "P", 0.0)
+
+        pump["y_pump_start"] = get(pump, "q", 0.0) > 0.0 ? 1.0 : 0.0
+        pump["z_pump_start"] = get(pump, "q", 0.0) > 0.0 ? 1.0 : 0.0
+    end
+end
+
+function _set_ne_pump_warm_start!(data::Dict{String, <:Any})
+    for pump in values(data["ne_pump"])
         flow_mid = 0.5 * (pump["flow_min"] + pump["flow_max"])
 
         pump["q_start"] = get(pump, "q", flow_mid)

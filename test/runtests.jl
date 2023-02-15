@@ -49,7 +49,7 @@ include("common.jl")
 
     include("data.jl")
 
-    include("function.jl")
+    include("variable.jl")
 
     include("io.jl")
 
@@ -58,6 +58,10 @@ include("common.jl")
     include("owf.jl")
 
     include("des.jl")
+
+    include("mdd.jl")
+
+    include("ne.jl")
 
     include("relax.jl")
 

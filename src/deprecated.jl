@@ -12,6 +12,18 @@ function run_des(args...; kwargs...)
 end
 
 
+function run_mdd(args...; kwargs...)
+    @warn("`run_mdd` has been replaced with `solve_mdd`", maxlog = 1)
+    solve_mdd(args...; kwargs...)
+end
+
+
+function run_mn_mdd(args...; kwargs...)
+    @warn("`run_mn_mdd` has been replaced with `solve_mn_mdd`", maxlog = 1)
+    solve_mn_mdd(args...; kwargs...)
+end
+
+
 function run_wf(args...; kwargs...)
     @warn("`run_wf` has been replaced with `solve_wf`", maxlog = 1)
     solve_wf(args...; kwargs...)
@@ -39,4 +51,22 @@ end
 function run_mn_owf(args...; kwargs...)
     @warn("`run_mn_owf` has been replaced with `solve_mn_owf`", maxlog = 1)
     solve_mn_owf(args...; kwargs...)
+end
+
+
+function run_mn_owf_switching(args...; kwargs...)
+    @warn("`run_mn_owf_switching` has been replaced with `solve_mn_owf_switching`", maxlog = 1)
+    solve_mn_owf_switching(args...; kwargs...)
+end
+
+
+function run_ne(args...; kwargs...)
+    @warn("`run_ne` has been replaced with `solve_ne`", maxlog = 1)
+    solve_ne(args...; kwargs...)
+end
+
+
+function run_mn_ne(args...; kwargs...)
+    @warn("`run_mn_ne` has been replaced with `solve_mn_ne`", maxlog = 1)
+    solve_mn_ne(args...; kwargs...)
 end

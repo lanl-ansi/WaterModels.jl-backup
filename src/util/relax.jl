@@ -1,5 +1,7 @@
 function _relax_binary_variable!(v::JuMP.VariableRef)
-    JuMP.unset_binary(v) # Make the binary variable continuous and free.
+    if JuMP.is_binary(v)
+        JuMP.unset_binary(v) # Make the binary variable continuous and free.
+    end
 
     if !JuMP.is_fixed(v) # If the variable is not fixed, set lower and upper bounds.
         JuMP.set_lower_bound(v, 0.0) # Lower-bound the relaxed binary variables.
@@ -21,7 +23,6 @@ function get_all_binary_vars_at_nw!(wm::AbstractWaterModel, nw::Int)
         vars_binary_inner = collect(filter(x -> JuMP.is_binary(x), vars))
         append!(vars_binary, vars_binary_inner)
     end
-    # println(vars_binary)
 
     return vars_binary
 end
@@ -53,6 +54,7 @@ function _relax_all_direction_variables!(wm::AbstractWaterModel)
     _relax_variables_with_symbol!(wm, :y_pump)
     _relax_variables_with_symbol!(wm, :y_regulator)
     _relax_variables_with_symbol!(wm, :y_short_pipe)
+    _relax_variables_with_symbol!(wm, :y_ne_short_pipe)
     _relax_variables_with_symbol!(wm, :y_valve)
 end
 

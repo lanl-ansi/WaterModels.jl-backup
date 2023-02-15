@@ -47,8 +47,10 @@ function variable_head(wm::AbstractWaterModel; nw::Int=nw_id_default, bounded::B
             node_to = ref(wm, nw, :node, des_pipe["node_to"])
 
             # Set the lower and upper bounds for the design pipe head difference.
-            JuMP.set_lower_bound(dh_des_pipe[a], node_fr["head_min"] - node_to["head_max"])
-            JuMP.set_upper_bound(dh_des_pipe[a], node_fr["head_max"] - node_to["head_min"])
+            dhn_max = max(0.0, node_to["head_max"] - node_fr["head_min"])
+            JuMP.set_lower_bound(dh_des_pipe[a], -dhn_max)
+            dhp_max = max(0.0, node_fr["head_max"] - node_to["head_min"])
+            JuMP.set_upper_bound(dh_des_pipe[a], dhp_max)
         end
     end
 
@@ -77,8 +79,8 @@ end
 function variable_pump_head_gain(wm::AbstractWaterModel; nw::Int=nw_id_default, bounded::Bool=true, report::Bool=true)
     # Initialize variables for total hydraulic head gain from a pump.
     g = var(wm, nw)[:g_pump] = JuMP.@variable(wm.model, [a in ids(wm, nw, :pump)],
-        base_name="$(nw)_g_pump", lower_bound=0.0, # Pump gain is nonnegative.
-        start=comp_start_value(ref(wm, nw, :pump, a), "g_pump_start", 1.0e-6))
+        base_name = "$(nw)_g_pump", lower_bound = 0.0, # Pump gain is nonnegative.
+        start = comp_start_value(ref(wm, nw, :pump, a), "g_pump_start", 1.0e-6))
 
     if bounded
         for (a, pump) in ref(wm, nw, :pump)
@@ -99,6 +101,33 @@ function variable_pump_head_gain(wm::AbstractWaterModel; nw::Int=nw_id_default, 
 
     # Initialize an entry to the solution component dictionary for head gains.
     report && sol_component_value(wm, nw, :pump, :g, ids(wm, nw, :pump), g)
+end
+
+function variable_ne_pump_head_gain(wm::AbstractWaterModel; nw::Int=nw_id_default, bounded::Bool=true, report::Bool=true)
+    # Initialize variables for total hydraulic head gain from an expansion pump.
+    g = var(wm, nw)[:g_ne_pump] = JuMP.@variable(wm.model, [a in ids(wm, nw, :ne_pump)],
+        base_name = "$(nw)_g_ne_pump", lower_bound = 0.0, # Pump gain is nonnegative.
+        start = comp_start_value(ref(wm, nw, :ne_pump, a), "g_ne_pump_start", 1.0e-6))
+
+    if bounded
+        for (a, pump) in ref(wm, nw, :ne_pump)
+            # Get the nodes that are connected by the pump.
+            node_fr = ref(wm, nw, :node, pump["node_fr"])
+            node_to = ref(wm, nw, :node, pump["node_to"])
+
+            # Set the upper bound for the head gain variable.
+            head_gain_max = _calc_pump_head_gain_max(pump, node_fr, node_to)
+            JuMP.set_upper_bound(g[a], head_gain_max)
+
+            # Set the start value for the head gain variable with possibly better data.
+            g_mid = 0.5 * head_gain_max # Midpoint of possible head gains.
+            g_start = comp_start_value(pump, "g_ne_pump_start", g_mid)
+            JuMP.set_start_value(g[a], g_start)
+        end
+    end
+
+    # Initialize an entry to the solution component dictionary for head gains.
+    report && sol_component_value(wm, nw, :ne_pump, :g, ids(wm, nw, :ne_pump), g)
 end
 
 
@@ -122,7 +151,7 @@ function variable_pump_power(wm::AbstractWaterModel; nw::Int=nw_id_default, boun
             # Get the nodes that are connected by the pump.
             node_fr = ref(wm, nw, :node, pump["node_fr"])
             node_to = ref(wm, nw, :node, pump["node_to"])
-    
+
             # Set the upper bound for the power variable.
             P_max = _calc_pump_power_max(pump, node_fr, node_to, rho_s, g_s)
             JuMP.set_upper_bound(P[a], P_max)
@@ -141,7 +170,7 @@ function variable_pump_power(wm::AbstractWaterModel; nw::Int=nw_id_default, boun
     # Create expressions to compute the unscaled pump costs.
     c = var(wm, nw)[:c_pump] = JuMP.@expression(
         wm.model, [a in ids(wm, nw, :pump)], E[a] *
-        ref(wm, nw, :pump, a)["energy_price"])
+        ref(wm, nw, :pump, a, "energy_price"))
 
     if report
         # Initialize entries to the solution component dictionary for expressions.
@@ -151,20 +180,69 @@ function variable_pump_power(wm::AbstractWaterModel; nw::Int=nw_id_default, boun
     end
 end
 
+function variable_ne_pump_power(wm::AbstractWaterModel; nw::Int=nw_id_default, bounded::Bool=true, report::Bool=true)
+    # Compute scaled density and gravity.
+    wm_data = get_wm_data(wm.data)
+    base_mass = get(wm_data, "base_mass", 1.0)
+    base_length = get(wm_data, "base_length", 1.0)
+    base_time = get(wm_data, "base_time", 1.0)
+
+    rho_s = _calc_scaled_density(base_mass, base_length)
+    g_s = _calc_scaled_gravity(base_length, base_time)
+
+    # Initialize variables for the power utilization of an expansion pump.
+    P = var(wm, nw)[:P_ne_pump] = JuMP.@variable(wm.model, [a in ids(wm, nw, :ne_pump)],
+        base_name = "$(nw)_P_ne_pump", lower_bound = 0.0, # Pump power is nonnegative.
+        start = comp_start_value(ref(wm, nw, :ne_pump, a), "P_ne_pump_start", 0.0))
+
+    if bounded
+        for (a, pump) in ref(wm, nw, :ne_pump)
+            # Get the nodes that are connected by the pump.
+            node_fr = ref(wm, nw, :node, pump["node_fr"])
+            node_to = ref(wm, nw, :node, pump["node_to"])
+
+            # Set the upper bound for the power variable.
+            P_max = _calc_pump_power_max(pump, node_fr, node_to, rho_s, g_s)
+            JuMP.set_upper_bound(P[a], P_max)
+
+            # Set the start value for the scaled power variable.
+            P_start = comp_start_value(pump, "P_ne_pump_start", 0.5 * P_max)
+            JuMP.set_start_value(P[a], P_start)
+        end
+    end
+
+    # Create expressions to compute the unscaled pump energies.
+    E = var(wm, nw)[:E_ne_pump] = JuMP.@expression(
+        wm.model, [a in ids(wm, nw, :ne_pump)],
+        P[a] * ref(wm, nw, :time_step))
+
+    # Create expressions to compute the unscaled pump costs.
+    c = var(wm, nw)[:c_ne_pump] = JuMP.@expression(
+        wm.model, [a in ids(wm, nw, :ne_pump)], E[a] *
+        ref(wm, nw, :ne_pump, a, "energy_price"))
+
+    if report
+        # Initialize entries to the solution component dictionary for expressions.
+        sol_component_value(wm, nw, :ne_pump, :P_ne, ids(wm, nw, :ne_pump), P)
+        sol_component_value(wm, nw, :ne_pump, :E, ids(wm, nw, :ne_pump), E)
+        sol_component_value(wm, nw, :ne_pump, :c, ids(wm, nw, :ne_pump), c)
+    end
+end
+
 
 "Instantiates outgoing flow variables for all reservoirs in the network, i.e.,
 `q_reservoir[i]` for `i` in `reservoir`. Note that these variables are always nonnegative,
 since for each reservoir, there will never be incoming flow."
 function variable_reservoir_flow(wm::AbstractWaterModel; nw::Int=nw_id_default, bounded::Bool=true, report::Bool=true)
     q_reservoir = var(wm, nw)[:q_reservoir] = JuMP.@variable(wm.model,
-        [i in ids(wm, nw, :reservoir)], lower_bound=0.0, base_name="$(nw)_q_reservoir",
-        start=comp_start_value(ref(wm, nw, :reservoir, i), "q_reservoir_start"))
+        [i in ids(wm, nw, :reservoir)], lower_bound = 0.0, base_name = "$(nw)_q_reservoir",
+        start = comp_start_value(ref(wm, nw, :reservoir, i), "q_reservoir_start"))
 
     if bounded
         for (i, reservoir) in ref(wm, nw, :reservoir)
             flow_min, flow_max = 0.0, 0.0
 
-            for name in ["des_pipe", "pipe", "pump", "regulator", "short_pipe", "valve"]
+            for name in _LINK_COMPONENTS
                 edges_fr = ref(wm, nw, Symbol(name * "_fr"), reservoir["node"])
                 edges_to = ref(wm, nw, Symbol(name * "_to"), reservoir["node"])
 
@@ -200,36 +278,39 @@ function variable_demand_flow(wm::AbstractWaterModel; nw::Int=nw_id_default, bou
         [i in ids(wm, nw, :dispatchable_demand)], base_name="$(nw)_q_demand",
         start=comp_start_value(ref(wm, nw, :dispatchable_demand, i), "q_demand_start"))
 
-    # if bounded
-    #     for (i, demand) in ref(wm, nw, :dispatchable_demand)
-    #         flow_min, flow_max = 0.0, 0.0
+    if bounded
+        for (i, demand) in ref(wm, nw, :dispatchable_demand)
+            flow_min, flow_max = 0.0, 0.0
 
-    #         for name in ["des_pipe", "pipe", "pump", "regulator", "short_pipe", "valve"]
-    #             edges_fr = ref(wm, nw, Symbol(name * "_fr"), demand["node"])
-    #             edges_to = ref(wm, nw, Symbol(name * "_to"), demand["node"])
+            for name in _LINK_COMPONENTS
+                edges_fr = ref(wm, nw, Symbol(name * "_fr"), demand["node"])
+                edges_to = ref(wm, nw, Symbol(name * "_to"), demand["node"])
 
-    #             if length(edges_fr) > 0
-    #                 flow_min -= sum(ref(wm, nw, Symbol(name), a)["flow_min"] for a in edges_fr)
-    #                 flow_max -= sum(ref(wm, nw, Symbol(name), a)["flow_max"] for a in edges_fr)
-    #             end
+                if length(edges_fr) > 0
+                    flow_min -= sum(ref(wm, nw, Symbol(name), a)["flow_max"] for a in edges_fr)
+                    flow_max -= sum(ref(wm, nw, Symbol(name), a)["flow_min"] for a in edges_fr)
+                end
 
-    #             if length(edges_to) > 0
-    #                 flow_min -= sum(ref(wm, nw, Symbol(name), a)["flow_max"] for a in edges_to)
-    #                 flow_max -= sum(ref(wm, nw, Symbol(name), a)["flow_min"] for a in edges_to)
-    #             end
-    #         end
+                if length(edges_to) > 0
+                    flow_min += sum(ref(wm, nw, Symbol(name), a)["flow_min"] for a in edges_to)
+                    flow_max += sum(ref(wm, nw, Symbol(name), a)["flow_max"] for a in edges_to)
+                end
+            end
 
-    #         flow_min = max(flow_min, demand["flow_min"])
-    #         flow_max = min(flow_max, demand["flow_max"])
 
-    #         JuMP.set_lower_bound(q_demand[i], flow_min)
-    #         JuMP.set_upper_bound(q_demand[i], flow_max)
+            flow_min = max(flow_min, demand["flow_min"])
+            JuMP.set_lower_bound(q_demand[i], flow_min)
+            ref(wm, nw, :demand, i)["flow_min"] = flow_min
 
-    #         flow_mid = flow_min + 0.5 * (flow_max - flow_min)
-    #         q_start = comp_start_value(demand, "q_demand_start", flow_mid)
-    #         JuMP.set_start_value(q_demand[i], q_start)
-    #     end
-    # end
+            flow_max = min(flow_max, demand["flow_max"])
+            JuMP.set_upper_bound(q_demand[i], flow_max)
+            ref(wm, nw, :demand, i)["flow_max"] = flow_max
+
+            flow_mid = 0.5 * (flow_min + flow_max)
+            q_start = comp_start_value(demand, "q_demand_start", flow_mid)
+            JuMP.set_start_value(q_demand[i], q_start)
+        end
+    end
 
     report && sol_component_value(wm, nw, :demand, :q, ids(wm, nw, :dispatchable_demand), q_demand)
 end
@@ -246,7 +327,7 @@ function variable_tank_flow(wm::AbstractWaterModel; nw::Int=nw_id_default, bound
         for (i, tank) in ref(wm, nw, :tank)
             flow_min, flow_max = 0.0, 0.0
 
-            for name in ["des_pipe", "pipe", "pump", "regulator", "short_pipe", "valve"]
+            for name in _LINK_COMPONENTS
                 edges_fr = ref(wm, nw, Symbol(name * "_fr"), tank["node"])
                 edges_to = ref(wm, nw, Symbol(name * "_to"), tank["node"])
 
@@ -261,12 +342,16 @@ function variable_tank_flow(wm::AbstractWaterModel; nw::Int=nw_id_default, bound
                 end
             end
 
+
+            flow_min = max(flow_min, get(tank, "flow_min", -Inf))
             JuMP.set_lower_bound(q_tank[i], flow_min)
-            JuMP.set_upper_bound(q_tank[i], flow_max)
             ref(wm, nw, :tank, i)["flow_min"] = flow_min
+
+            flow_max = min(flow_max, get(tank, "flow_max", Inf))
+            JuMP.set_upper_bound(q_tank[i], flow_max)
             ref(wm, nw, :tank, i)["flow_max"] = flow_max
 
-            flow_mid = 0.5 * (flow_max + flow_min)
+            flow_mid = 0.5 * (flow_min + flow_max)
             q_start = comp_start_value(tank, "q_tank_start", flow_mid)
             JuMP.set_start_value(q_tank[i], q_start)
         end
@@ -343,6 +428,72 @@ function variable_pump_indicator(wm::AbstractWaterModel; nw::Int=nw_id_default, 
     report && sol_component_value(wm, nw, :pump, :status, ids(wm, nw, :pump), z_pump)
 end
 
+"Creates binary variables for all network expansion pumps in the network, i.e.,
+`z_ne_pump[a]` for `a` in `ne_pump`, where one denotes that the pump is
+selected for expansion (i.e., built), and zero indicates that it is not selected."
+function variable_ne_pump_indicator(wm::AbstractWaterModel; nw::Int=nw_id_default, relax::Bool=false, report::Bool=true)
+    if !relax
+        z_ne_pump = var(wm, nw)[:z_ne_pump] = JuMP.@variable(wm.model,
+            [a in ids(wm, nw, :ne_pump)], base_name = "$(nw)_z_ne_pump", binary = true,
+            start = comp_start_value(ref(wm, nw, :ne_pump, a), "z_ne_pump_start", 1.0))
+    else
+        z_ne_pump = var(wm, nw)[:z_ne_pump] = JuMP.@variable(wm.model,
+            [a in ids(wm, nw, :ne_pump)], base_name = "$(nw)_ne_pump",
+            lower_bound = 0.0, upper_bound = 1.0,
+            start = comp_start_value(ref(wm, nw, :ne_pump, a), "z_ne_pump_start", 1.0))
+    end
+
+    for (a, ne_pump) in ref(wm, nw, :ne_pump)
+        _fix_indicator_variable(z_ne_pump[a], ne_pump, "z")
+    end
+
+    report && sol_component_value(wm, nw, :ne_pump, :status, ids(wm, nw, :ne_pump), z_ne_pump)
+end
+
+"Creates binary variables for all network expansion pumps in the network, i.e.,
+`x_ne_pump[a]` for `a` in `ne_pump`, where one denotes that the pump is
+selected for expansion (i.e., built), and zero indicates that it is not selected."
+function variable_ne_pump_build(wm::AbstractWaterModel; nw::Int=nw_id_default, relax::Bool=false, report::Bool=true)
+    if !relax
+        x_ne_pump = var(wm, nw)[:x_ne_pump] = JuMP.@variable(wm.model,
+            [a in ids(wm, nw, :ne_pump)], base_name = "$(nw)_x_ne_pump", binary = true,
+            start = comp_start_value(ref(wm, nw, :ne_pump, a), "x_ne_pump_start", 1.0))
+    else
+        x_ne_pump = var(wm, nw)[:x_ne_pump] = JuMP.@variable(wm.model,
+            [a in ids(wm, nw, :ne_pump)], base_name = "$(nw)_ne_pump",
+            lower_bound = 0.0, upper_bound = 1.0,
+            start = comp_start_value(ref(wm, nw, :ne_pump, a), "x_ne_pump_start", 1.0))
+    end
+
+    # for (a, ne_pump) in ref(wm, nw, :ne_pump)
+    #     _fix_indicator_variable(x_ne_pump[a], ne_pump, "x")
+    # end
+
+    report && sol_component_value(wm, nw, :ne_pump, :build_status, ids(wm, nw, :ne_pump), x_ne_pump)
+end
+
+"Creates binary variables for all network expansion short pipes in the network, i.e.,
+`z_ne_short_pipe[a]` for `a` in `ne_short_pipe`, where one denotes that the short pipe is
+selected for expansion (i.e., built), and zero indicates that it is not selected."
+function variable_ne_short_pipe_indicator(wm::AbstractWaterModel; nw::Int=nw_id_default, relax::Bool=false, report::Bool=true)
+    if !relax
+        z_ne_short_pipe = var(wm, nw)[:z_ne_short_pipe] = JuMP.@variable(wm.model,
+            [a in ids(wm, nw, :ne_short_pipe)], base_name = "$(nw)_z_ne_short_pipe", binary = true,
+            start = comp_start_value(ref(wm, nw, :ne_short_pipe, a), "z_ne_short_pipe_start", 1.0))
+    else
+        z_ne_short_pipe = var(wm, nw)[:z_ne_short_pipe] = JuMP.@variable(wm.model,
+            [a in ids(wm, nw, :ne_short_pipe)], base_name = "$(nw)_z_ne_short_pipe",
+            lower_bound = 0.0, upper_bound = 1.0,
+            start = comp_start_value(ref(wm, nw, :ne_short_pipe, a), "z_ne_short_pipe_start", 1.0))
+    end
+
+    for (a, ne_short_pipe) in ref(wm, nw, :ne_short_pipe)
+        _fix_indicator_variable(z_ne_short_pipe[a], ne_short_pipe, "z")
+    end
+
+    report && sol_component_value(wm, nw, :ne_short_pipe, :status, ids(wm, nw, :ne_short_pipe), z_ne_short_pipe)
+end
+
 
 ""
 function variable_pump_switch_on(wm::AbstractWaterModel; nw::Int=nw_id_default, relax::Bool=false, report::Bool=true)
@@ -364,6 +515,26 @@ function variable_pump_switch_on(wm::AbstractWaterModel; nw::Int=nw_id_default, 
     report && sol_component_value(wm, nw, :pump, :switch_on, ids(wm, nw, :pump), z_switch_on_pump)
 end
 
+""
+function variable_ne_pump_switch_on(wm::AbstractWaterModel; nw::Int=nw_id_default, relax::Bool=false, report::Bool=true)
+    if !relax
+        z_switch_on_ne_pump = var(wm, nw)[:z_switch_on_ne_pump] = JuMP.@variable(wm.model,
+            [a in ids(wm, nw, :ne_pump)], base_name = "$(nw)_z_switch_on_ne_pump", binary = true,
+            start = comp_start_value(ref(wm, nw, :ne_pump, a), "z_switch_on_ne_pump_start", 1.0))
+    else
+        z_switch_on_ne_pump = var(wm, nw)[:z_switch_on_ne_pump] = JuMP.@variable(wm.model,
+            [a in ids(wm, nw, :ne_pump)], base_name = "$(nw)_z_switch_on_ne_pump",
+            lower_bound = 0.0, upper_bound = 1.0,
+            start = comp_start_value(ref(wm, nw, :ne_pump, a), "z_switch_on_ne_pump_start", 1.0))
+    end
+
+    for (a, pump) in ref(wm, nw, :ne_pump)
+        _fix_indicator_variable(z_switch_on_ne_pump[a], pump, "z_switch_on")
+    end
+
+    report && sol_component_value(wm, nw, :ne_pump, :switch_on, ids(wm, nw, :ne_pump), z_switch_on_ne_pump)
+end
+
 
 ""
 function variable_pump_switch_off(wm::AbstractWaterModel; nw::Int=nw_id_default, relax::Bool=false, report::Bool=true)
@@ -383,6 +554,27 @@ function variable_pump_switch_off(wm::AbstractWaterModel; nw::Int=nw_id_default,
     end
 
     report && sol_component_value(wm, nw, :pump, :switch_off, ids(wm, nw, :pump), z_switch_off_pump)
+end
+
+
+""
+function variable_ne_pump_switch_off(wm::AbstractWaterModel; nw::Int=nw_id_default, relax::Bool=false, report::Bool=true)
+    if !relax
+        z_switch_off_ne_pump = var(wm, nw)[:z_switch_off_ne_pump] = JuMP.@variable(wm.model,
+            [a in ids(wm, nw, :ne_pump)], base_name = "$(nw)_z_switch_off_ne_pump", binary = true,
+            start = comp_start_value(ref(wm, nw, :ne_pump, a), "z_switch_off_ne_pump_start", 1.0))
+    else
+        z_switch_off_ne_pump = var(wm, nw)[:z_switch_off_ne_pump] = JuMP.@variable(wm.model,
+            [a in ids(wm, nw, :ne_pump)], base_name = "$(nw)_z_switch_off_ne_pump",
+            lower_bound = 0.0, upper_bound = 1.0,
+            start = comp_start_value(ref(wm, nw, :ne_pump, a), "z_switch_off_ne_pump_start", 1.0))
+    end
+
+    for (a, pump) in ref(wm, nw, :ne_pump)
+        _fix_indicator_variable(z_switch_off_ne_pump[a], pump, "z_switch_off")
+    end
+
+    report && sol_component_value(wm, nw, :ne_pump, :switch_off, ids(wm, nw, :ne_pump), z_switch_off_ne_pump)
 end
 
 
@@ -412,9 +604,9 @@ end
 function _fix_indicator_variable(v::JuMP.VariableRef, component::Dict{String, <:Any}, name::String)
     min_name, max_name = name * "_min", name * "_max"
 
-    if haskey(component, min_name) && haskey(component, max_name)
-        if component[min_name] == component[max_name]
-            JuMP.fix(v, component[min_name])
-        end
+    if haskey(component, min_name) && component[min_name] > 0.01
+        JuMP.fix(v, 1.0; force = true)
+    elseif haskey(component, max_name) && component[max_name] < 0.99
+        JuMP.fix(v, 0.0; force = true)
     end
 end
